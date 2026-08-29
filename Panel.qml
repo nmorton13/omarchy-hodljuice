@@ -39,6 +39,7 @@ Panel {
   property bool saved: false
   property bool autoplayPending: false
   property bool recoverWithRetune: true
+  property bool waitingForPlaybackStart: false
   property int automaticRetuneAttempts: 0
   readonly property int maximumAutomaticRetunes: 3
   property int tuningFrame: 0
@@ -160,6 +161,8 @@ Panel {
       return
     }
     autoplayPending = false
+    waitingForPlaybackStart = false
+    playbackStartTimer.stop()
     persistPosition()
     var value = savedEpisodes[index]
     episode = value
@@ -210,7 +213,8 @@ Panel {
     recoverWithRetune = true
     if (automatic !== true) automaticRetuneAttempts = 0
     autoplayPending = false
-    playbackHealthTimer.stop()
+    waitingForPlaybackStart = false
+    playbackStartTimer.stop()
     if (resumeProcess.running) resumeProcess.running = false
     persistPosition()
     if (["buffering", "playing", "paused"].indexOf(playbackState) >= 0 && !stopProcess.running) {
@@ -247,7 +251,8 @@ Panel {
 
   function recoverUnavailableEpisode(message) {
     autoplayPending = false
-    playbackHealthTimer.stop()
+    waitingForPlaybackStart = false
+    playbackStartTimer.stop()
     if (!recoverWithRetune) {
       playbackState = "error"
       errorMessage = "This saved episode is unavailable. Remove it or Retune."
@@ -299,6 +304,10 @@ Panel {
 
   function playCurrent() {
     if (!episode || !episode.audioUrl) return
+    if (statusProcess.running) {
+      statusProcess.gotStatus = true
+      statusProcess.running = false
+    }
     playbackState = "buffering"
     playProcess.command = cliCommand([
       "play",
@@ -406,8 +415,22 @@ Panel {
     function toggle(): void { root.toggle() }
     function retune(): string { root.retune(); return "ok" }
     function playback(): string { root.togglePlayback(); return "ok" }
+    function state(): string {
+      return JSON.stringify({
+        playback: root.playbackState,
+        error: root.errorMessage,
+        title: root.episodeTitle,
+        podcast: root.podcastName,
+        waitingForPlaybackStart: root.waitingForPlaybackStart
+      })
+    }
     function save(): string { root.saveCurrent(); return "ok" }
     function saved(): string { root.open(); root.openSaved(); return "ok" }
+    function playSaved(index: int): string {
+      if (index < 0 || index >= root.savedEpisodes.length) return "missing saved episode"
+      root.playSavedEpisode(index)
+      return "ok"
+    }
     function tune(): string { root.open(); root.toggleTuner(); return "ok" }
     function people(): string { root.open(); root.openPeople(); return "ok" }
     function all(): string {
@@ -437,10 +460,13 @@ Panel {
   }
 
   Timer {
-    id: playbackHealthTimer
-    interval: 10000
+    id: playbackStartTimer
+    interval: 12000
     repeat: false
-    onTriggered: root.automaticRetuneAttempts = 0
+    onTriggered: {
+      if (root.waitingForPlaybackStart)
+        root.recoverUnavailableEpisode("That podcast did not begin playing. Retuning…")
+    }
   }
 
   Timer {
@@ -653,9 +679,10 @@ Panel {
     }
     onExited: function(exitCode) {
       if (exitCode === 0) {
-        root.playbackState = "playing"
+        root.playbackState = "buffering"
+        root.waitingForPlaybackStart = true
         root.errorMessage = ""
-        playbackHealthTimer.restart()
+        playbackStartTimer.restart()
       } else {
         root.recoverUnavailableEpisode(root.errorMessage || "That podcast could not start. Retuning…")
       }
@@ -694,9 +721,11 @@ Panel {
         statusProcess.gotStatus = true
         root.statusFailureCount = 0
         if (root.playbackState === "loading") return
-        if (status.playback === "stopped" && playbackHealthTimer.running) {
-          root.recoverUnavailableEpisode("That podcast is unavailable. Retuning…")
-          return
+        if (root.waitingForPlaybackStart) {
+          if (status.playback === "stopped") return
+          root.waitingForPlaybackStart = false
+          playbackStartTimer.stop()
+          root.automaticRetuneAttempts = 0
         }
         root.playbackState = status.playback === "stopped" ? "idle" : status.playback
         if (status.position !== null) root.positionSeconds = status.position
@@ -705,7 +734,7 @@ Panel {
       }
     }
     onExited: function(exitCode) {
-      if (exitCode === 0 && gotStatus) return
+      if (gotStatus) return
       root.statusFailureCount++
       if (root.statusFailureCount >= 3) {
         root.playbackState = "error"
