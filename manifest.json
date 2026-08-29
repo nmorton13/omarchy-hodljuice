@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "id": "nmorton.hodljuice",
+  "name": "HodlJuice",
+  "version": "0.1.0-dev",
+  "author": "Nick Morton",
+  "license": "MIT",
+  "description": "A theme-native Bitcoin podcast broadcast receiver with random discovery and a live voice signal",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "HodlJuice",
+    "description": "Tune into a random Bitcoin podcast episode",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "center",
+    "defaults": {
+      "band": "all",
+      "range": "any",
+      "barMode": "signal-title",
+      "reduceMotion": false
+    },
+    "schema": [
+      {
+        "key": "barMode",
+        "type": "select",
+        "label": "Bar display",
+        "options": [
+          { "label": "Signal and title", "value": "signal-title" },
+          { "label": "Signal", "value": "signal" },
+          { "label": "Icon", "value": "icon" }
+        ]
+      },
+      {
+        "key": "reduceMotion",
+        "type": "boolean",
+        "label": "Reduce motion"
+      }
+    ]
+  }
+}

@@ -1,0 +1,695 @@
+#!/usr/bin/env python3
+"""HodlJuice discovery and mpv control CLI.
+
+This is the first vertical-slice adapter. The website parser is intentionally
+isolated so a versioned JSON API can replace it without changing the plugin.
+"""
+
+from __future__ import annotations
+
+import argparse
+import array
+import html
+import json
+import math
+import os
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import asdict, dataclass
+from html.parser import HTMLParser
+from pathlib import Path
+from typing import Any
+
+BASE_URL = "https://hodljuice.app"
+MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+USER_AGENT = "HodlJuice-Omarchy/0.1 (+https://hodljuice.app)"
+SPECTRUM_BANDS = 21
+SPECTRUM_RATE = 16_000
+SPECTRUM_WINDOW = 640
+VALID_BANDS = {"all", "humanitarian", "climate_energy", "video", "money", "people"}
+
+
+class HodlJuiceError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class Episode:
+    guid: str
+    podcast: str
+    artist: str
+    title: str
+    audioUrl: str
+    podcastUrl: str
+    artworkUrl: str
+    publishedAt: str
+    sourceUrl: str
+
+
+class PeopleParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.in_people_select = False
+        self.option_value = ""
+        self.option_parts: list[str] = []
+        self.people: list[dict[str, str]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = {key: value or "" for key, value in attrs}
+        if tag == "select" and values.get("id") == "person":
+            self.in_people_select = True
+        elif tag == "option" and self.in_people_select:
+            self.option_value = values.get("value", "").strip()
+            self.option_parts = []
+
+    def handle_data(self, data: str) -> None:
+        if self.option_value:
+            self.option_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "option" and self.option_value:
+            label = " ".join("".join(self.option_parts).split())
+            if label:
+                self.people.append({"value": self.option_value, "label": label})
+            self.option_value = ""
+            self.option_parts = []
+        elif tag == "select" and self.in_people_select:
+            self.in_people_select = False
+
+
+class EpisodeParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.metadata: dict[str, str] | None = None
+        self.info_depth = 0
+        self.capture_tag: str | None = None
+        self.capture_parts: list[str] = []
+        self.podcast = ""
+        self.title = ""
+        self.published_at = ""
+        self.paragraphs: list[str] = []
+        self.audio_url = ""
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = {key: value or "" for key, value in attrs}
+        classes = values.get("class", "").split()
+        if "episode-info-mappapi" in classes:
+            self.metadata = values
+        if tag == "div" and "podcast-info-container" in classes:
+            self.info_depth = 1
+        elif tag == "div" and self.info_depth:
+            self.info_depth += 1
+        if self.info_depth and tag in {"h1", "h3", "p"} and self.capture_tag is None:
+            self.capture_tag = tag
+            self.capture_parts = []
+        if self.info_depth and tag == "span" and "episode-date-text" in classes:
+            self.capture_tag = "date-span"
+            self.capture_parts = []
+        if tag == "source" and not self.audio_url:
+            self.audio_url = values.get("src", "")
+
+    def handle_data(self, data: str) -> None:
+        if self.capture_tag:
+            self.capture_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if self.capture_tag == "date-span" and tag == "span":
+            self.published_at = " ".join("".join(self.capture_parts).split())
+            self.capture_tag = None
+        elif self.capture_tag == tag:
+            text = " ".join("".join(self.capture_parts).split())
+            if tag == "h1" and not self.podcast:
+                self.podcast = text
+            elif tag == "h3" and not self.title:
+                self.title = text
+            elif tag == "p" and text:
+                self.paragraphs.append(text)
+            self.capture_tag = None
+        if tag == "div" and self.info_depth:
+            self.info_depth -= 1
+
+
+def _http_url(value: str, *, allow_relative: bool = False) -> str:
+    if allow_relative and value.startswith("/"):
+        return urllib.parse.urljoin(BASE_URL, value)
+    parsed = urllib.parse.urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return value
+
+
+def build_discovery_url(
+    band: str = "all",
+    range_value: str = "any",
+    person: str | None = None,
+    date: str | None = None,
+) -> str:
+    if band not in VALID_BANDS:
+        raise HodlJuiceError(f"Unsupported band: {band}")
+
+    if band == "people":
+        if not person:
+            raise HodlJuiceError("The people band requires --person")
+        safe_person = urllib.parse.quote(person.replace(" ", "_"), safe="_")
+        path = f"/person/{safe_person}"
+    elif band == "all":
+        path = "/"
+    else:
+        path = f"/{band}"
+
+    query: dict[str, str] = {}
+    if date:
+        if band != "all":
+            raise HodlJuiceError("The current HodlJuice site cannot combine a category with a date")
+        path = "/custom_date_filter"
+        query = {"date": date}
+    elif range_value not in {"", "any"}:
+        if band != "all":
+            raise HodlJuiceError("The current HodlJuice site cannot combine a category with a time range")
+        if range_value not in {"7", "30"} and not (len(range_value) == 4 and range_value.isdigit()):
+            raise HodlJuiceError(f"Unsupported range: {range_value}")
+        query["year"] = range_value
+    elif band == "all":
+        # The site's empty year filter is its reliable all-time random route.
+        query["year"] = ""
+
+    url = urllib.parse.urljoin(BASE_URL, path)
+    return url + ("?" + urllib.parse.urlencode(query) if query else "")
+
+
+def parse_episode(document: str, source_url: str) -> Episode:
+    parser = EpisodeParser()
+    parser.feed(document)
+    metadata = parser.metadata or {}
+    audio_url = _http_url(html.unescape(metadata.get("data-audio-url", "") or parser.audio_url))
+    if not audio_url:
+        raise HodlJuiceError("The selected episode has no valid audio URL")
+
+    title = html.unescape(metadata.get("data-title", "") or parser.title).strip()
+    podcast = html.unescape(metadata.get("data-podcast-name", "") or parser.podcast).strip()
+    if not title or not podcast:
+        raise HodlJuiceError("The selected episode is missing its title or podcast name")
+
+    artist = html.unescape(metadata.get("data-podcast-artist", "")).strip()
+    if not artist and parser.paragraphs:
+        artist = parser.paragraphs[0].removeprefix("by:").strip()
+
+    return Episode(
+        guid=metadata.get("data-guid", "").strip(),
+        podcast=podcast,
+        artist=artist,
+        title=title,
+        audioUrl=audio_url,
+        podcastUrl=_http_url(html.unescape(metadata.get("data-podcast-link", ""))),
+        artworkUrl=_http_url(html.unescape(metadata.get("data-artwork-url", "")), allow_relative=True),
+        publishedAt=(metadata.get("data-episode-date", "") or parser.published_at).strip(),
+        sourceUrl=source_url,
+    )
+
+
+def fetch_document(url: str, timeout: float = 18.0) -> str:
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            declared_size = response.headers.get("Content-Length")
+            try:
+                response_size = int(declared_size) if declared_size else None
+            except (TypeError, ValueError):
+                response_size = None
+            if response_size is not None and response_size > MAX_RESPONSE_BYTES:
+                raise HodlJuiceError("HodlJuice response exceeded the size limit")
+            body = response.read(MAX_RESPONSE_BYTES + 1)
+            if len(body) > MAX_RESPONSE_BYTES:
+                raise HodlJuiceError("HodlJuice response exceeded the size limit")
+            charset = response.headers.get_content_charset() or "utf-8"
+    except (urllib.error.URLError, TimeoutError, OSError) as error:
+        raise HodlJuiceError(f"Unable to reach HodlJuice: {error}") from error
+    return body.decode(charset, errors="replace")
+
+
+def fetch_people(timeout: float = 18.0) -> list[dict[str, str]]:
+    parser = PeopleParser()
+    parser.feed(fetch_document(BASE_URL + "/people", timeout))
+    if not parser.people:
+        raise HodlJuiceError("HodlJuice returned no people choices")
+    return parser.people
+
+
+def fetch_episode(url: str, timeout: float = 18.0) -> Episode:
+    return parse_episode(fetch_document(url, timeout), url)
+
+
+def xdg_state_dir() -> Path:
+    root = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
+    path = root / "hodljuice"
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        path.chmod(0o700)
+    except OSError:
+        pass
+    return path
+
+
+def runtime_dir() -> Path:
+    root = os.environ.get("XDG_RUNTIME_DIR")
+    path = Path(root) / "hodljuice" if root else Path("/tmp") / f"hodljuice-{os.getuid()}"
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    stat = path.stat()
+    if path.is_symlink() or not path.is_dir() or stat.st_uid != os.getuid() or stat.st_mode & 0o077:
+        raise HodlJuiceError(f"Unsafe runtime directory: {path}")
+    return path
+
+
+def read_json_file(path: Path, fallback: Any) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return fallback
+
+
+def atomic_json_write(path: Path, value: Any) -> None:
+    """Write private state without exposing a partial file or shared temp name."""
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            descriptor = -1
+            output.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+
+
+def tolerant_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def episode_record(episode: Episode | dict[str, Any]) -> dict[str, Any]:
+    value = asdict(episode) if isinstance(episode, Episode) else dict(episode)
+    return {
+        "guid": str(value.get("guid", "")),
+        "podcast": str(value.get("podcast", "")),
+        "artist": str(value.get("artist", "")),
+        "title": str(value.get("title", "")),
+        "audioUrl": _http_url(str(value.get("audioUrl", ""))),
+        "podcastUrl": _http_url(str(value.get("podcastUrl", ""))),
+        "artworkUrl": _http_url(str(value.get("artworkUrl", "")), allow_relative=True),
+        "publishedAt": str(value.get("publishedAt", "")),
+        "sourceUrl": _http_url(str(value.get("sourceUrl", ""))),
+        "savedAt": tolerant_int(value.get("savedAt", 0)),
+        "discoveredAt": tolerant_int(value.get("discoveredAt", 0)),
+    }
+
+
+def record_history(episode: Episode, limit: int = 100) -> None:
+    path = xdg_state_dir() / "history.json"
+    current = read_json_file(path, [])
+    current = current if isinstance(current, list) else []
+    value = episode_record(episode)
+    value["discoveredAt"] = int(time.time())
+    items = [value] + [item for item in current if isinstance(item, dict) and item.get("audioUrl") != value["audioUrl"]]
+    atomic_json_write(path, items[:limit])
+
+
+def save_episode(value: dict[str, Any]) -> None:
+    record = episode_record(value)
+    if not record["audioUrl"] or not record["title"]:
+        raise HodlJuiceError("Saving requires a valid episode URL and title")
+    record["savedAt"] = int(time.time())
+    path = xdg_state_dir() / "saved.json"
+    current = read_json_file(path, [])
+    current = current if isinstance(current, list) else []
+    items = [record] + [item for item in current if isinstance(item, dict) and item.get("audioUrl") != record["audioUrl"]]
+    atomic_json_write(path, items)
+
+
+def remove_saved_episode(url: str) -> None:
+    path = xdg_state_dir() / "saved.json"
+    current = read_json_file(path, [])
+    current = current if isinstance(current, list) else []
+    atomic_json_write(path, [item for item in current if isinstance(item, dict) and item.get("audioUrl") != url])
+
+
+def remember_position(url: str, seconds: float) -> None:
+    if not _http_url(url):
+        raise HodlJuiceError("Position requires a valid episode URL")
+    path = xdg_state_dir() / "positions.json"
+    values = read_json_file(path, {})
+    values = values if isinstance(values, dict) else {}
+    if seconds <= 5:
+        values.pop(url, None)
+    else:
+        values[url] = {"seconds": round(max(0.0, seconds), 3), "updatedAt": int(time.time())}
+    atomic_json_write(path, values)
+
+
+def resume_position(url: str) -> float:
+    values = read_json_file(xdg_state_dir() / "positions.json", {})
+    if not isinstance(values, dict) or not isinstance(values.get(url), dict):
+        return 0.0
+    try:
+        return max(0.0, float(values[url].get("seconds", 0)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def mpv_socket_path() -> Path:
+    return runtime_dir() / "mpv.sock"
+
+
+def mpv_command(command: list[Any], timeout: float = 2.0) -> Any:
+    path = mpv_socket_path()
+    if not path.exists():
+        raise HodlJuiceError("HodlJuice playback is not running")
+    request_id = 1
+    payload = json.dumps({"command": command, "request_id": request_id}).encode() + b"\n"
+    pending = b""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(timeout)
+            client.connect(str(path))
+            client.sendall(payload)
+            while True:
+                chunk = client.recv(65536)
+                if not chunk:
+                    break
+                pending += chunk
+                if len(pending) > 1024 * 1024:
+                    raise HodlJuiceError("mpv response exceeded the size limit")
+                while b"\n" in pending:
+                    line, pending = pending.split(b"\n", 1)
+                    if not line:
+                        continue
+                    try:
+                        value = json.loads(line)
+                    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+                        raise HodlJuiceError("mpv returned an invalid response") from error
+                    if not isinstance(value, dict) or "event" in value:
+                        continue
+                    if value.get("request_id", request_id) != request_id or "error" not in value:
+                        continue
+                    if value.get("error") != "success":
+                        raise HodlJuiceError(f"mpv command failed: {value.get('error', 'unknown error')}")
+                    return value.get("data")
+    except HodlJuiceError:
+        raise
+    except OSError as error:
+        raise HodlJuiceError(f"Unable to control playback: {error}") from error
+    raise HodlJuiceError("mpv returned no response")
+
+
+def wait_for_socket(path: Path, process: subprocess.Popen[bytes], timeout: float = 3.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return
+        if process.poll() is not None:
+            raise HodlJuiceError("mpv exited before its control socket was ready")
+        time.sleep(0.04)
+    raise HodlJuiceError("Timed out waiting for mpv")
+
+
+def start_playback(url: str, title: str, artist: str, start: float = 0.0) -> None:
+    url = _http_url(url)
+    if not url:
+        raise HodlJuiceError("Playback requires a valid HTTP(S) audio URL")
+    path = mpv_socket_path()
+    reused_process = False
+    if path.exists():
+        try:
+            # force-media-title is process-wide, so refresh it before every
+            # load when reusing the long-lived mpv instance.
+            mpv_command(["set_property", "force-media-title", title])
+            mpv_command(["loadfile", url, "replace"])
+            reused_process = True
+        except HodlJuiceError:
+            path.unlink(missing_ok=True)
+
+    if not reused_process:
+        try:
+            process = subprocess.Popen(
+                [
+                    "mpv",
+                    "--idle=yes",
+                    "--no-video",
+                    "--audio-display=no",
+                    "--force-window=no",
+                    "--terminal=no",
+                    "--really-quiet",
+                    "--input-ipc-server=" + str(path),
+                    "--audio-client-name=hodljuice",
+                    "--force-media-title=" + title,
+                    url,
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except FileNotFoundError as error:
+            raise HodlJuiceError("mpv is required for playback") from error
+        wait_for_socket(path, process)
+
+    if start > 0:
+        mpv_command(["seek", start, "absolute", "exact"])
+
+    atomic_json_write(
+        xdg_state_dir() / "current.json",
+        {"schemaVersion": 1, "audioUrl": url, "title": title, "artist": artist, "updatedAt": int(time.time())},
+    )
+
+
+def playback_status() -> dict[str, Any]:
+    if not mpv_socket_path().exists():
+        return {"schemaVersion": 1, "playback": "stopped"}
+    if bool(mpv_command(["get_property", "idle-active"])):
+        return {"schemaVersion": 1, "playback": "stopped"}
+    paused = bool(mpv_command(["get_property", "pause"]))
+    return {
+        "schemaVersion": 1,
+        "playback": "paused" if paused else "playing",
+        "position": mpv_command(["get_property", "time-pos"]),
+        "duration": mpv_command(["get_property", "duration"]),
+        "volume": mpv_command(["get_property", "volume"]),
+    }
+
+
+def spectrum_centers() -> list[float]:
+    low, high = 90.0, 7600.0
+    ratio = (high / low) ** (1.0 / (SPECTRUM_BANDS - 1))
+    return [low * ratio**index for index in range(SPECTRUM_BANDS)]
+
+
+def analyze_spectrum(samples: list[int], previous: list[float] | None = None) -> list[float]:
+    if not samples:
+        return [0.0] * SPECTRUM_BANDS
+    size = len(samples)
+    prior = previous if previous and len(previous) == SPECTRUM_BANDS else [0.0] * SPECTRUM_BANDS
+    windowed_samples = [
+        sample * (0.5 - 0.5 * math.cos(2.0 * math.pi * sample_index / max(1, size - 1)))
+        for sample_index, sample in enumerate(samples)
+    ]
+    result: list[float] = []
+    for index, frequency in enumerate(spectrum_centers()):
+        omega = 2.0 * math.pi * frequency / SPECTRUM_RATE
+        coefficient = 2.0 * math.cos(omega)
+        q1 = q2 = 0.0
+        for windowed in windowed_samples:
+            q0 = coefficient * q1 - q2 + windowed
+            q2, q1 = q1, q0
+        power = max(0.0, q1 * q1 + q2 * q2 - coefficient * q1 * q2)
+        magnitude = math.sqrt(power) / (size * 32768.0)
+        decibels = 20.0 * math.log10(max(magnitude, 1e-8))
+        normalized = max(0.0, min(1.0, (decibels + 72.0) / 52.0))
+        smoothing = 0.62 if normalized > prior[index] else 0.20
+        result.append(round(prior[index] + (normalized - prior[index]) * smoothing, 4))
+    return result
+
+
+def stream_spectrum(target: str = "hodljuice", frames: int = 0) -> None:
+    command = [
+        "pw-record",
+        "--target", target,
+        "--rate", str(SPECTRUM_RATE),
+        "--channels", "1",
+        "--format", "s16",
+        "--raw", "-",
+    ]
+    try:
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except FileNotFoundError as error:
+        raise HodlJuiceError("pw-record is required for the live signal") from error
+    assert process.stdout is not None
+    previous = [0.0] * SPECTRUM_BANDS
+    emitted = 0
+    pending = b""
+    try:
+        while frames <= 0 or emitted < frames:
+            while len(pending) < SPECTRUM_WINDOW * 2:
+                chunk = process.stdout.read(SPECTRUM_WINDOW * 2 - len(pending))
+                if not chunk:
+                    raise HodlJuiceError("The HodlJuice PipeWire signal ended")
+                pending += chunk
+            frame, pending = pending[: SPECTRUM_WINDOW * 2], pending[SPECTRUM_WINDOW * 2 :]
+            values = array.array("h")
+            values.frombytes(frame)
+            if sys.byteorder != "little":
+                values.byteswap()
+            previous = analyze_spectrum(values.tolist(), previous)
+            print(json.dumps(previous, separators=(",", ":")), flush=True)
+            emitted += 1
+    except BrokenPipeError:
+        return
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            process.kill()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="hodljuice", description="HodlJuice Bitcoin broadcast receiver")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    discover = subparsers.add_parser("discover", help="receive a random matching episode")
+    discover.add_argument("--band", choices=sorted(VALID_BANDS), default="all")
+    discover.add_argument("--range", dest="range_value", default="any")
+    discover.add_argument("--person")
+    discover.add_argument("--date")
+    discover.add_argument("--json", action="store_true")
+    discover.add_argument("--url-only", action="store_true", help=argparse.SUPPRESS)
+
+    people = subparsers.add_parser("people", help="list people exposed by HodlJuice")
+    people.add_argument("--json", action="store_true")
+
+    save = subparsers.add_parser("save", help="save an episode locally")
+    save.add_argument("--url", required=True)
+    save.add_argument("--title", required=True)
+    save.add_argument("--podcast", default="")
+    save.add_argument("--artist", default="")
+    save.add_argument("--published", default="")
+    save.add_argument("--artwork", default="")
+    unsave = subparsers.add_parser("unsave", help="remove a saved episode")
+    unsave.add_argument("--url", required=True)
+    is_saved = subparsers.add_parser("is-saved", help="check whether an episode is saved")
+    is_saved.add_argument("--url", required=True)
+    subparsers.add_parser("saved", help="list saved episodes as JSON")
+    subparsers.add_parser("history", help="list recent discoveries as JSON")
+
+    play = subparsers.add_parser("play", help="play an audio URL")
+    play.add_argument("--url", required=True)
+    play.add_argument("--title", default="HodlJuice")
+    play.add_argument("--artist", default="HodlJuice")
+    play.add_argument("--start", type=float, default=0.0)
+
+    position = subparsers.add_parser("position", help="remember an episode position")
+    position.add_argument("--url", required=True)
+    position.add_argument("--seconds", required=True, type=float)
+    resume = subparsers.add_parser("resume", help="read an episode resume position")
+    resume.add_argument("--url", required=True)
+
+    subparsers.add_parser("toggle", help="toggle play/pause")
+    seek = subparsers.add_parser("seek", help="seek by a relative number of seconds")
+    seek.add_argument("seconds", type=float)
+    subparsers.add_parser("status", help="show playback status as JSON")
+    subparsers.add_parser("current", help="show the last played episode as JSON")
+    subparsers.add_parser("stop", help="stop playback")
+    spectrum = subparsers.add_parser("spectrum", help="stream the 21-band playback signal as JSON lines")
+    spectrum.add_argument("--target", default="hodljuice")
+    spectrum.add_argument("--frames", type=int, default=0, help=argparse.SUPPRESS)
+    subparsers.add_parser("doctor", help="check runtime dependencies")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        if args.command == "discover":
+            url = build_discovery_url(args.band, args.range_value, args.person, args.date)
+            if args.url_only:
+                print(url)
+                return 0
+            episode = fetch_episode(url)
+            record_history(episode)
+            if args.json:
+                print(json.dumps(asdict(episode), ensure_ascii=False))
+            else:
+                print(f"{episode.podcast} — {episode.title}\n{episode.audioUrl}")
+        elif args.command == "people":
+            people = fetch_people()
+            if args.json:
+                print(json.dumps(people, ensure_ascii=False))
+            else:
+                for person in people:
+                    print(f"{person['value']}\t{person['label']}")
+        elif args.command == "save":
+            save_episode({
+                "audioUrl": args.url,
+                "title": args.title,
+                "podcast": args.podcast,
+                "artist": args.artist,
+                "publishedAt": args.published,
+                "artworkUrl": args.artwork,
+            })
+        elif args.command == "unsave":
+            remove_saved_episode(args.url)
+        elif args.command == "is-saved":
+            values = read_json_file(xdg_state_dir() / "saved.json", [])
+            print(json.dumps(any(isinstance(item, dict) and item.get("audioUrl") == args.url for item in values)))
+        elif args.command == "saved":
+            print(json.dumps(read_json_file(xdg_state_dir() / "saved.json", []), ensure_ascii=False))
+        elif args.command == "history":
+            print(json.dumps(read_json_file(xdg_state_dir() / "history.json", []), ensure_ascii=False))
+        elif args.command == "play":
+            start_playback(args.url, args.title, args.artist, max(0.0, args.start))
+        elif args.command == "position":
+            remember_position(args.url, args.seconds)
+        elif args.command == "resume":
+            print(json.dumps({"seconds": resume_position(args.url)}))
+        elif args.command == "toggle":
+            mpv_command(["cycle", "pause"])
+        elif args.command == "seek":
+            mpv_command(["seek", args.seconds, "relative"])
+        elif args.command == "status":
+            print(json.dumps(playback_status(), ensure_ascii=False))
+        elif args.command == "current":
+            print(json.dumps(read_json_file(xdg_state_dir() / "current.json", {}), ensure_ascii=False))
+        elif args.command == "stop":
+            mpv_command(["stop"])
+        elif args.command == "spectrum":
+            stream_spectrum(args.target, max(0, args.frames))
+        elif args.command == "doctor":
+            from shutil import which
+
+            result = {
+                "mpv": which("mpv") is not None,
+                "pwRecord": which("pw-record") is not None,
+                "runtimeDir": str(runtime_dir()),
+                "site": BASE_URL,
+            }
+            print(json.dumps(result))
+            return 0 if result["mpv"] and result["pwRecord"] else 1
+    except HodlJuiceError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
