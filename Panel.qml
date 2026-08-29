@@ -38,6 +38,7 @@ Panel {
   property real resumeSeconds: 0
   property bool saved: false
   property bool autoplayPending: false
+  property bool recoverWithRetune: true
   property int automaticRetuneAttempts: 0
   readonly property int maximumAutomaticRetunes: 3
   property int tuningFrame: 0
@@ -51,6 +52,9 @@ Panel {
   property string pendingPerson: person
   property int tunerIndex: 0
   property int personIndex: 0
+  property int savedIndex: 0
+  property var savedEpisodes: []
+  property bool savedLoading: false
   property var peopleOptions: []
   property bool peopleLoading: false
   readonly property var tunerRanges: [
@@ -140,6 +144,57 @@ Panel {
     viewMode = "tuner"
   }
 
+  function openSaved() {
+    savedIndex = 0
+    savedLoading = true
+    viewMode = "saved"
+    if (savedListProcess.running) return
+    savedListProcess.command = cliCommand(["saved"])
+    savedListProcess.running = true
+  }
+
+  function playSavedEpisode(index) {
+    if (index < 0 || index >= savedEpisodes.length) return
+    if (resumeProcess.running) {
+      Qt.callLater(function() { root.playSavedEpisode(index) })
+      return
+    }
+    autoplayPending = false
+    persistPosition()
+    var value = savedEpisodes[index]
+    episode = value
+    saved = true
+    resumeSeconds = 0
+    positionSeconds = 0
+    durationSeconds = 0
+    errorMessage = ""
+    playbackState = "idle"
+    recoverWithRetune = false
+    autoplayPending = true
+    viewMode = "receiver"
+    checkResume()
+  }
+
+  function removeSavedEpisode(index) {
+    if (index < 0 || index >= savedEpisodes.length || savedRemoveProcess.running) return
+    savedRemoveProcess.removeIndex = index
+    savedRemoveProcess.removeUrl = String(savedEpisodes[index].audioUrl || "")
+    savedRemoveProcess.command = cliCommand(["unsave", "--url", savedRemoveProcess.removeUrl])
+    savedRemoveProcess.running = true
+  }
+
+  function ensureSavedVisible() {
+    if (viewMode !== "saved") return
+    Qt.callLater(function() {
+      var rowTop = savedList.y + savedIndex * Style.space(63)
+      var rowBottom = rowTop + Style.space(58)
+      if (rowTop < contentFlickable.contentY)
+        contentFlickable.contentY = Math.max(0, rowTop)
+      else if (rowBottom > contentFlickable.contentY + contentFlickable.height)
+        contentFlickable.contentY = Math.max(0, Math.min(contentFlickable.contentHeight - contentFlickable.height, rowBottom - contentFlickable.height))
+    })
+  }
+
   function applyTuning() {
     if (pendingBand === "people" && !pendingPerson) { openPeople(); return }
     band = pendingBand
@@ -152,6 +207,7 @@ Panel {
 
   function retune(automatic) {
     if (playbackState === "loading") return
+    recoverWithRetune = true
     if (automatic !== true) automaticRetuneAttempts = 0
     autoplayPending = false
     playbackHealthTimer.stop()
@@ -192,6 +248,11 @@ Panel {
   function recoverUnavailableEpisode(message) {
     autoplayPending = false
     playbackHealthTimer.stop()
+    if (!recoverWithRetune) {
+      playbackState = "error"
+      errorMessage = "This saved episode is unavailable. Remove it or Retune."
+      return
+    }
     if (automaticRetuneTimer.running) return
     if (automaticRetuneAttempts >= maximumAutomaticRetunes) {
       playbackState = "error"
@@ -289,12 +350,14 @@ Panel {
 
   function activateFocus() {
     if (viewMode === "people") { choosePerson(personIndex); return }
+    if (viewMode === "saved") { playSavedEpisode(savedIndex); return }
     if (viewMode === "tuner") { chooseTuner(tunerIndex); return }
     if (focusIndex === 0) seek(-30)
     else if (focusIndex === 1) togglePlayback()
     else if (focusIndex === 2) seek(30)
     else if (focusIndex === 3) retune()
     else if (focusIndex === 4) saveCurrent()
+    else if (focusIndex === 5) openSaved()
   }
 
   function moveFocus(dx, dy) {
@@ -304,14 +367,20 @@ Panel {
       if (dy !== 0) personIndex = (personIndex + (dy > 0 ? 1 : peopleTotal - 1)) % peopleTotal
       return
     }
+    if (viewMode === "saved") {
+      var savedTotal = Math.max(1, savedEpisodes.length)
+      if (dy !== 0) savedIndex = (savedIndex + (dy > 0 ? 1 : savedTotal - 1)) % savedTotal
+      ensureSavedVisible()
+      return
+    }
     if (viewMode === "tuner") {
       var total = tunerRanges.length + 1
       if (dy !== 0) tunerIndex = (tunerIndex + (dy > 0 ? 1 : total - 1)) % total
       else if (dx !== 0) tunerIndex = (tunerIndex + (dx > 0 ? 1 : total - 1)) % total
       return
     }
-    if (dy !== 0) focusIndex = (focusIndex + (dy > 0 ? 1 : 4)) % 5
-    else if (dx !== 0) focusIndex = (focusIndex + (dx > 0 ? 1 : 4)) % 5
+    if (dy !== 0) focusIndex = (focusIndex + (dy > 0 ? 1 : 5)) % 6
+    else if (dx !== 0) focusIndex = (focusIndex + (dx > 0 ? 1 : 5)) % 6
   }
 
   onOpenedChanged: if (opened) Qt.callLater(function() { keyCatcher.forceActiveFocus() })
@@ -338,6 +407,7 @@ Panel {
     function retune(): string { root.retune(); return "ok" }
     function playback(): string { root.togglePlayback(); return "ok" }
     function save(): string { root.saveCurrent(); return "ok" }
+    function saved(): string { root.open(); root.openSaved(); return "ok" }
     function tune(): string { root.open(); root.toggleTuner(); return "ok" }
     function people(): string { root.open(); root.openPeople(); return "ok" }
     function all(): string {
@@ -521,6 +591,42 @@ Panel {
   }
 
   Process {
+    id: savedListProcess
+    command: []
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var values = Model.parseEpisodeList(text)
+        root.savedEpisodes = values || []
+        root.savedIndex = Math.min(root.savedIndex, Math.max(0, root.savedEpisodes.length - 1))
+      }
+    }
+    onExited: function(exitCode) {
+      root.savedLoading = false
+      if (exitCode !== 0) root.errorMessage = "Unable to load saved episodes."
+    }
+  }
+
+  Process {
+    id: savedRemoveProcess
+    property int removeIndex: -1
+    property string removeUrl: ""
+    command: []
+    onExited: function(exitCode) {
+      if (exitCode !== 0) {
+        root.errorMessage = "Unable to remove the saved episode."
+        return
+      }
+      var values = root.savedEpisodes.slice()
+      if (removeIndex >= 0 && removeIndex < values.length) values.splice(removeIndex, 1)
+      root.savedEpisodes = values
+      root.savedIndex = Math.min(root.savedIndex, Math.max(0, values.length - 1))
+      if (root.episode && String(root.episode.audioUrl || "") === removeUrl) root.saved = false
+      root.errorMessage = ""
+    }
+  }
+
+  Process {
     id: saveProcess
     property bool nextSaved: false
     command: []
@@ -644,11 +750,17 @@ Panel {
       onActivateRequested: root.activateFocus()
       onCloseRequested: {
         if (root.viewMode === "people") root.viewMode = "tuner"
-        else if (root.viewMode === "tuner") root.viewMode = "receiver"
+        else if (root.viewMode === "saved" || root.viewMode === "tuner") root.viewMode = "receiver"
         else root.close()
       }
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(text) {
+        if (root.viewMode === "saved") {
+          if (text === "s" || text === "S" || text === "x" || text === "X") root.removeSavedEpisode(root.savedIndex)
+          else if (text === "b" || text === "B") root.viewMode = "receiver"
+          return
+        }
+        if (text === "b" || text === "B") { root.openSaved(); return }
         if (text === "t" || text === "T") {
           if (root.viewMode === "people") root.viewMode = "tuner"
           else root.toggleTuner()
@@ -663,6 +775,7 @@ Panel {
       }
 
       Flickable {
+        id: contentFlickable
         anchors.fill: parent
         contentWidth: width
         contentHeight: content.implicitHeight
@@ -846,6 +959,14 @@ Panel {
             }
           }
 
+          ReceiverButton {
+            visible: root.viewMode === "receiver"
+            width: parent.width
+            label: "SAVED EPISODES"
+            selected: root.cursorActive && root.focusIndex === 5
+            onTriggered: root.openSaved()
+          }
+
           Rectangle {
             visible: root.viewMode === "receiver"
             width: parent.width
@@ -923,6 +1044,66 @@ Panel {
               selected: root.cursorActive && root.tunerIndex === root.tunerRanges.length
               emphasized: true
               onTriggered: root.applyTuning()
+            }
+          }
+
+          Column {
+            visible: root.viewMode === "saved"
+            width: parent.width
+            spacing: Style.space(10)
+
+            Text {
+              width: parent.width
+              text: "SAVED EPISODES"
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.heading
+              font.bold: true
+              font.letterSpacing: 1
+            }
+            Text {
+              width: parent.width
+              text: root.savedLoading ? "LOADING SAVED SIGNALS…" : (root.savedEpisodes.length === 0 ? "No saved episodes yet. Press S while receiving an episode to add one." : "Select an episode to resume and play it.")
+              color: root.muted
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+            Column {
+              id: savedList
+              visible: !root.savedLoading && root.savedEpisodes.length > 0
+              width: parent.width
+              spacing: Style.space(5)
+
+              Repeater {
+                model: root.savedEpisodes
+                SavedEpisodeOption {
+                  required property var modelData
+                  required property int index
+                  width: parent.width
+                  podcast: String(modelData.podcast || modelData.artist || "Unknown podcast")
+                  episodeTitle: String(modelData.title || "Untitled episode")
+                  published: String(modelData.publishedAt || "")
+                  choiceIndex: index
+                  selected: root.cursorActive && root.savedIndex === index
+                  onTriggered: root.playSavedEpisode(index)
+                  onRemoveRequested: root.removeSavedEpisode(index)
+                }
+              }
+            }
+            Text {
+              visible: root.errorMessage !== ""
+              width: parent.width
+              text: root.errorMessage
+              color: root.urgent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+            ReceiverButton {
+              width: parent.width
+              label: "BACK TO RECEIVER"
+              onTriggered: root.viewMode = "receiver"
             }
           }
 
@@ -1009,7 +1190,7 @@ Panel {
 
           Text {
             width: parent.width
-            text: root.viewMode === "receiver" ? "SPACE PLAY  ·  H/L SEEK  ·  S SAVE  ·  R RETUNE  ·  T TUNE  ·  ESC CLOSE" : "↑/↓ SELECT  ·  ENTER CHOOSE  ·  T BACK  ·  ESC BACK"
+            text: root.viewMode === "receiver" ? "SPACE PLAY  ·  H/L SEEK  ·  S SAVE  ·  B SAVED  ·  R RETUNE  ·  T TUNE" : (root.viewMode === "saved" ? "↑/↓ SELECT  ·  ENTER PLAY  ·  S REMOVE  ·  ESC BACK" : "↑/↓ SELECT  ·  ENTER CHOOSE  ·  T BACK  ·  ESC BACK")
             color: root.muted
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
@@ -1017,6 +1198,92 @@ Panel {
             font.letterSpacing: 0.4
           }
         }
+      }
+    }
+  }
+
+  component SavedEpisodeOption: Rectangle {
+    id: savedOption
+    property string podcast: ""
+    property string episodeTitle: ""
+    property string published: ""
+    property int choiceIndex: 0
+    property bool selected: false
+    signal triggered()
+    signal removeRequested()
+
+    height: Style.space(58)
+    radius: Style.cornerRadius
+    color: selected || savedMouse.containsMouse
+      ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.16)
+      : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.045)
+    border.width: selected ? 1 : 0
+    border.color: root.accent
+
+    Column {
+      anchors.left: parent.left
+      anchors.right: removeButton.left
+      anchors.leftMargin: Style.space(10)
+      anchors.rightMargin: Style.space(8)
+      anchors.verticalCenter: parent.verticalCenter
+      spacing: Style.space(2)
+      Text {
+        width: parent.width
+        text: savedOption.podcast.toUpperCase() + (savedOption.published ? "  //  " + savedOption.published : "")
+        color: root.accent
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        font.bold: true
+        elide: Text.ElideRight
+      }
+      Text {
+        width: parent.width
+        text: savedOption.episodeTitle
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+        elide: Text.ElideRight
+      }
+    }
+
+    MouseArea {
+      id: savedMouse
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onEntered: {
+        root.cursorActive = true
+        root.savedIndex = savedOption.choiceIndex
+      }
+      onClicked: savedOption.triggered()
+    }
+
+    Rectangle {
+      id: removeButton
+      z: 2
+      anchors.right: parent.right
+      anchors.rightMargin: Style.space(8)
+      anchors.verticalCenter: parent.verticalCenter
+      width: Style.space(62)
+      height: Style.space(28)
+      radius: Style.cornerRadius
+      color: removeMouse.containsMouse
+        ? Qt.rgba(root.urgent.r, root.urgent.g, root.urgent.b, 0.18)
+        : Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.06)
+      Text {
+        anchors.centerIn: parent
+        text: "REMOVE"
+        color: removeMouse.containsMouse ? root.urgent : root.muted
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        font.bold: true
+      }
+      MouseArea {
+        id: removeMouse
+        anchors.fill: parent
+        hoverEnabled: true
+        cursorShape: Qt.PointingHandCursor
+        onClicked: savedOption.removeRequested()
       }
     }
   }

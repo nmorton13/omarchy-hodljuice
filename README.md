@@ -28,7 +28,8 @@ The full implementation plan is in [`docs/implementation-plan.md`](docs/implemen
 - Per-process PipeWire capture of only the named HodlJuice mpv stream
 - 21 logarithmic bands with real voice response, attack, and decay
 - Keyboard-first Band/Range tuner plus a live two-column People tuner
-- Local save/unsave, bounded discovery history, and per-episode resume positions
+- Local save/unsave with a keyboard/pointer Saved Episodes library
+- Bounded discovery history and per-episode resume positions
 - Live dark/light theme validation
 - Unit, fixture, manifest, and native Omarchy validation
 

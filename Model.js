@@ -34,6 +34,18 @@ function parseEpisode(text) {
   }
 }
 
+function parseEpisodeList(text) {
+  try {
+    var values = JSON.parse(String(text || ""))
+    if (!Array.isArray(values)) return null
+    return values.filter(function(value) {
+      return value && typeof value === "object" && String(value.audioUrl || "") !== "" && String(value.title || "") !== ""
+    })
+  } catch (error) {
+    return null
+  }
+}
+
 function parsePeople(text) {
   try {
     var values = JSON.parse(String(text || ""))

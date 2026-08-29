@@ -17,7 +17,7 @@
 - [x] Per-process PipeWire capture using the named `hodljuice` mpv node
 - [x] Real 21-band voice-responsive analyzer and QML stream
 - [x] Keyboard-first range tuner with Any Time, Last 7 Days, and Last 30 Days filters
-- [x] Local save/unsave button with duplicate-safe persistence
+- [x] Local save/unsave button and keyboard/pointer Saved Episodes library
 - [x] Bounded, duplicate-safe discovery history
 - [x] Per-episode resume position persistence and playback start offset
 - [x] Live panel validation under Omarchy 4
@@ -26,7 +26,7 @@
 
 ## Next
 
-1. Add panel views for saved episodes and recent history.
+1. Add a panel view for recent discovery history.
 2. Decide when category, people, and calendar-year filters are ready to return to the UI.
 3. Complete MPRIS behavior and media-key validation.
 4. Tune spectrum normalization across varied podcast feeds and measure CPU/memory.
@@ -35,7 +35,7 @@
 ## Explicitly incomplete
 
 - MPRIS metadata/control is not explicitly owned by HodlJuice; mpv metadata already appears in Omarchy's media surface.
-- Saved episodes and history persist in the core, but browsing views are not yet implemented in the panel.
+- Discovery history persists in the core, but its browsing view is not yet implemented in the panel.
 - Category and date-range combinations require the proposed JSON API.
 - Artwork treatment has not been decided.
 - The website adapter still parses HTML pending a versioned JSON endpoint.
