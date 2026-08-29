@@ -424,6 +424,32 @@ def wait_for_socket(path: Path, process: subprocess.Popen[bytes], timeout: float
     raise HodlJuiceError("Timed out waiting for mpv")
 
 
+def wait_for_media_ready(url: str, start: float = 0.0, timeout: float = 12.0) -> None:
+    """Wait for mpv to adopt a URL before applying a resume seek.
+
+    loadfile is asynchronous: seeking immediately can fail while the new file
+    still goes on to play, which made the UI report a false playback failure.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            current_url = mpv_command(["get_property", "path"])
+            idle = bool(mpv_command(["get_property", "idle-active"]))
+            if current_url == url and not idle:
+                if start > 0:
+                    try:
+                        mpv_command(["seek", start, "absolute", "exact"])
+                    except HodlJuiceError:
+                        time.sleep(0.1)
+                        continue
+                mpv_command(["set_property", "pause", False])
+                return
+        except HodlJuiceError:
+            pass
+        time.sleep(0.1)
+    raise HodlJuiceError("The podcast did not become playable")
+
+
 def start_playback(url: str, title: str, artist: str, start: float = 0.0) -> None:
     url = _http_url(url)
     if not url:
@@ -465,8 +491,7 @@ def start_playback(url: str, title: str, artist: str, start: float = 0.0) -> Non
             raise HodlJuiceError("mpv is required for playback") from error
         wait_for_socket(path, process)
 
-    if start > 0:
-        mpv_command(["seek", start, "absolute", "exact"])
+    wait_for_media_ready(url, start)
 
     atomic_json_write(
         xdg_state_dir() / "current.json",

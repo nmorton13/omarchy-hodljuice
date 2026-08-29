@@ -39,7 +39,6 @@ Panel {
   property bool saved: false
   property bool autoplayPending: false
   property bool recoverWithRetune: true
-  property bool waitingForPlaybackStart: false
   property int automaticRetuneAttempts: 0
   readonly property int maximumAutomaticRetunes: 3
   property int tuningFrame: 0
@@ -161,8 +160,6 @@ Panel {
       return
     }
     autoplayPending = false
-    waitingForPlaybackStart = false
-    playbackStartTimer.stop()
     persistPosition()
     var value = savedEpisodes[index]
     episode = value
@@ -213,8 +210,6 @@ Panel {
     recoverWithRetune = true
     if (automatic !== true) automaticRetuneAttempts = 0
     autoplayPending = false
-    waitingForPlaybackStart = false
-    playbackStartTimer.stop()
     if (resumeProcess.running) resumeProcess.running = false
     persistPosition()
     if (["buffering", "playing", "paused"].indexOf(playbackState) >= 0 && !stopProcess.running) {
@@ -251,8 +246,6 @@ Panel {
 
   function recoverUnavailableEpisode(message) {
     autoplayPending = false
-    waitingForPlaybackStart = false
-    playbackStartTimer.stop()
     if (!recoverWithRetune) {
       playbackState = "error"
       errorMessage = "This saved episode is unavailable. Remove it or Retune."
@@ -420,8 +413,7 @@ Panel {
         playback: root.playbackState,
         error: root.errorMessage,
         title: root.episodeTitle,
-        podcast: root.podcastName,
-        waitingForPlaybackStart: root.waitingForPlaybackStart
+        podcast: root.podcastName
       })
     }
     function save(): string { root.saveCurrent(); return "ok" }
@@ -457,16 +449,6 @@ Panel {
     interval: 900
     repeat: false
     onTriggered: root.retune(true)
-  }
-
-  Timer {
-    id: playbackStartTimer
-    interval: 12000
-    repeat: false
-    onTriggered: {
-      if (root.waitingForPlaybackStart)
-        root.recoverUnavailableEpisode("That podcast did not begin playing. Retuning…")
-    }
   }
 
   Timer {
@@ -679,10 +661,9 @@ Panel {
     }
     onExited: function(exitCode) {
       if (exitCode === 0) {
-        root.playbackState = "buffering"
-        root.waitingForPlaybackStart = true
+        root.playbackState = "playing"
+        root.automaticRetuneAttempts = 0
         root.errorMessage = ""
-        playbackStartTimer.restart()
       } else {
         root.recoverUnavailableEpisode(root.errorMessage || "That podcast could not start. Retuning…")
       }
@@ -721,12 +702,6 @@ Panel {
         statusProcess.gotStatus = true
         root.statusFailureCount = 0
         if (root.playbackState === "loading") return
-        if (root.waitingForPlaybackStart) {
-          if (status.playback === "stopped") return
-          root.waitingForPlaybackStart = false
-          playbackStartTimer.stop()
-          root.automaticRetuneAttempts = 0
-        }
         root.playbackState = status.playback === "stopped" ? "idle" : status.playback
         if (status.position !== null) root.positionSeconds = status.position
         if (status.duration !== null) root.durationSeconds = status.duration

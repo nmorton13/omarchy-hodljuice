@@ -126,13 +126,41 @@ class PlaybackTests(unittest.TestCase):
 
         with mock.patch.object(MODULE, "mpv_socket_path", return_value=socket_path), mock.patch.object(
             MODULE, "mpv_command", side_effect=lambda command: commands.append(command)
-        ):
-            MODULE.start_playback("https://media.example/next.mp3", "Next episode", "Podcast")
+        ), mock.patch.object(MODULE, "wait_for_media_ready") as ready:
+            MODULE.start_playback("https://media.example/next.mp3", "Next episode", "Podcast", 12)
+
+        ready.assert_called_once_with("https://media.example/next.mp3", 12)
 
         self.assertEqual(commands[:2], [
             ["set_property", "force-media-title", "Next episode"],
             ["loadfile", "https://media.example/next.mp3", "replace"],
         ])
+
+    def test_wait_for_media_retries_resume_seek_until_load_is_ready(self):
+        seek_attempts = 0
+        unpaused = False
+
+        def command(args):
+            nonlocal seek_attempts, unpaused
+            if args == ["get_property", "path"]:
+                return "https://media.example/next.mp3"
+            if args == ["get_property", "idle-active"]:
+                return False
+            if args[0] == "seek":
+                seek_attempts += 1
+                if seek_attempts == 1:
+                    raise MODULE.HodlJuiceError("not ready")
+                return None
+            if args == ["set_property", "pause", False]:
+                unpaused = True
+                return None
+            raise AssertionError(args)
+
+        with mock.patch.object(MODULE, "mpv_command", side_effect=command), mock.patch.object(MODULE.time, "sleep"):
+            MODULE.wait_for_media_ready("https://media.example/next.mp3", 12, timeout=1)
+
+        self.assertEqual(seek_attempts, 2)
+        self.assertTrue(unpaused)
 
     def test_mpv_command_skips_async_events(self):
         socket_path = Path(self.temp.name) / "mpv.sock"
