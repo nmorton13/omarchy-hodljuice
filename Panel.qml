@@ -1194,7 +1194,7 @@ Panel {
 
           Text {
             width: parent.width
-            text: root.viewMode === "receiver" ? "SPACE PLAY  ·  H/L SEEK  ·  S SAVE  ·  B SAVED  ·  R RETUNE  ·  T TUNE" : (root.viewMode === "saved" ? "↑/↓ SELECT  ·  ENTER PLAY  ·  S REMOVE  ·  ESC BACK" : "↑/↓ SELECT  ·  ENTER CHOOSE  ·  T BACK  ·  ESC BACK")
+            text: root.viewMode === "receiver" ? "SPACE  ·  H/L  ·  S SAVE  ·  B SAVED  ·  R RETUNE  ·  T TUNE" : (root.viewMode === "saved" ? "↑/↓ SELECT  ·  ENTER PLAY  ·  S REMOVE  ·  ESC BACK" : "↑/↓ SELECT  ·  ENTER CHOOSE  ·  T BACK  ·  ESC BACK")
             color: root.muted
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption

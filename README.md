@@ -6,6 +6,8 @@ HodlJuice tunes into a random episode from [hodljuice.app](https://hodljuice.app
 
 > **Status:** early beta (`0.1.0-dev`). The core Tune → Listen → Retune experience is working and tested on Omarchy 4.
 
+![HodlJuice receiver playing a Bitcoin podcast with its live 21-band signal](docs/assets/hodljuice-panel.png)
+
 ## Features
 
 - Random Bitcoin podcast discovery with automatic playback
