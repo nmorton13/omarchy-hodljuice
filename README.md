@@ -1,117 +1,150 @@
 # HodlJuice for Omarchy
 
-A theme-native Bitcoin broadcast receiver for the Omarchy shell.
+A theme-native Bitcoin podcast receiver for the Omarchy shell.
 
-HodlJuice keeps the original product's simple idea—tune a filter and receive a random Bitcoin podcast episode—while making spoken audio visible through a real 21-band signal. It is an Omarchy plugin first, with a reusable CLI/service intended to support a future TUI.
+HodlJuice tunes into a random episode from [hodljuice.app](https://hodljuice.app), autoplays it through `mpv`, and renders a real 21-band voice signal captured from only the HodlJuice PipeWire stream.
 
-> **Status:** working vertical slice. Discovery, playback, status, real per-stream PipeWire spectrum, and the first Band/Range tuner are running inside Omarchy.
+> **Status:** early beta (`0.1.0-dev`). The core Tune → Listen → Retune experience is working and tested on Omarchy 4.
 
-## Design promises
+## Features
 
-- Active Omarchy themes own every color, surface, border, font, radius, and spacing choice.
-- The 21-band playing visualization will be derived from actual HodlJuice audio, never random animation.
-- Tune → Listen → Retune remains the primary interaction.
-- Keyboard and pointer paths are both first class.
-- No account, analytics, advertising, or tracking.
+- Random Bitcoin podcast discovery with automatic playback
+- Any Time, Last 7 Days, and Last 30 Days filters
+- Retune keeps the active filter and automatically skips unavailable results
+- Real per-stream 21-band spectrum—no fake animation during playback
+- Podcast name and compact live signal in the Omarchy bar
+- Play/pause, ±30-second seeking, progress, duration, and resume position
+- Local Saved Episodes library with keyboard and pointer navigation
+- Theme-native colors, type, spacing, borders, and light/dark behavior
+- Local-only state with no account, analytics, advertising, or telemetry
 
-The full implementation plan is in [`docs/implementation-plan.md`](docs/implementation-plan.md).
+## Controls
 
-## Current vertical slice
+| Key | Action |
+|---|---|
+| `Space` | Play or pause |
+| `H` / `L` | Seek backward or forward 30 seconds |
+| `R` | Retune and autoplay using the active filter |
+| `T` | Open or close the filter tuner |
+| `S` | Save or unsave the current episode |
+| `B` | Open Saved Episodes |
+| `J` / `K` or arrows | Move selection |
+| `Enter` | Activate the selected item |
+| `Esc` | Go back or close the panel |
 
-- Valid Omarchy 4 bar-widget manifest
-- Theme-derived receiver panel and real 21-band renderer
-- Real random episode discovery from `hodljuice.app`
-- Main, category, recent/year, person, and date URL contracts in the CLI
-- Hidden episode metadata parsed into a stable JSON contract
-- Long-lived `mpv` playback controlled through a private IPC socket
-- Play/pause, ±30-second seeking, progress, duration, and remaining time
-- Per-process PipeWire capture of only the named HodlJuice mpv stream
-- 21 logarithmic bands with real voice response, attack, and decay
-- Keyboard-first Band/Range tuner plus a live two-column People tuner
-- Local save/unsave with a keyboard/pointer Saved Episodes library
-- Bounded discovery history and per-episode resume positions
-- Live dark/light theme validation
-- Unit, fixture, manifest, and native Omarchy validation
-
-The playing signal is generated from actual decoded HodlJuice audio. The only synthetic movement is the bounded **TUNING** sweep while a discovery request is active. See [`docs/spectrum.md`](docs/spectrum.md).
+Pointer controls are available for every primary action. On the bar, left click opens the receiver, middle click Retunes, and right click toggles playback.
 
 ## Install
 
+Once this repository is published, install it with its Git URL:
+
 ```bash
-omarchy plugin add <git-url> --enable
+omarchy plugin add https://github.com/OWNER/REPOSITORY.git --enable
 ```
 
-HodlJuice is self-contained inside the plugin directory; the shell invokes its bundled CLI directly. Run `./bin/hodljuice doctor` from the installed checkout if playback or the visualizer is unavailable.
+The widget defaults to the center section. Move it at any time with:
 
-To remove it:
+```bash
+omarchy bar move nmorton.hodljuice --section center
+```
+
+Remove it with:
 
 ```bash
 omarchy plugin remove nmorton.hodljuice
 ```
 
+## Requirements
+
+- Omarchy 4.0+
+- Python 3.11+
+- `mpv`
+- PipeWire tools providing `pw-record`
+- Network access to `https://hodljuice.app` and episode audio hosts
+
+Check the runtime environment from the installed plugin directory:
+
+```bash
+./bin/hodljuice doctor
+```
+
+## Saved episodes and local data
+
+Saving creates a local bookmark; it does not download the audio. Saved metadata is duplicate-safe by audio URL, and selecting a saved episode resumes and autoplays it. If a saved URL becomes unavailable, HodlJuice reports the failure instead of silently replacing the explicit selection.
+
+State is stored under:
+
+```text
+$XDG_STATE_HOME/hodljuice/
+```
+
+This is normally `~/.local/state/hodljuice/` and contains saved episodes, bounded discovery history, resume positions, and current playback metadata. Private runtime files live under `$XDG_RUNTIME_DIR/hodljuice/` with user-only permissions.
+
 ## Development
+
+Run the complete local validation suite:
 
 ```bash
 ./tests/run.sh
 ./bin/hodljuice doctor
+```
+
+Test an endpoint directly:
+
+```bash
+./bin/hodljuice discover --band all --range any --json
+./bin/hodljuice discover --band all --range 7 --json
 ./bin/hodljuice discover --band all --range 30 --json
 ```
 
-Test the checkout in Omarchy by copying it into the plugin directory (Omarchy plugin installs do not support repository symlinks):
+Install the current checkout for live Omarchy testing without copying `.git` or generated files:
 
 ```bash
-rm -rf ~/.config/omarchy/plugins/nmorton.hodljuice
-cp -a . ~/.config/omarchy/plugins/nmorton.hodljuice
+plugin="$HOME/.config/omarchy/plugins/nmorton.hodljuice"
+rm -rf "$plugin"
+mkdir -p "$plugin"
+tar --exclude=.git --exclude='__pycache__' --exclude='*.pyc' \
+  -cf - . | tar -xf - -C "$plugin"
+
 omarchy-shell shell rescanPlugins
 omarchy plugin enable nmorton.hodljuice --section center
-```
-
-Open it over shell IPC:
-
-```bash
 omarchy-shell shell summon nmorton.hodljuice '{}'
 ```
 
-After changing panel geometry, restart the shell if hot reload does not replace the mounted widget:
+After changing a mounted bar widget or panel structure, restart the shell:
 
 ```bash
 omarchy restart shell
 ```
 
-## CLI
+### CLI
+
+The QML plugin invokes its bundled CLI directly. During development, use `./bin/hodljuice`:
 
 ```bash
-hodljuice discover --band all --range any --json
-hodljuice discover --band money --range 30 --json
-hodljuice people --json
-hodljuice discover --band people --person Lyn_Alden --json
-hodljuice play --url HTTPS_URL --title "Episode" --artist "Podcast"
-hodljuice toggle
-hodljuice seek -30
-hodljuice status
-hodljuice saved
-hodljuice history
-hodljuice resume --url HTTPS_URL
-hodljuice stop
+./bin/hodljuice status
+./bin/hodljuice current
+./bin/hodljuice toggle
+./bin/hodljuice seek -30
+./bin/hodljuice saved
+./bin/hodljuice history
+./bin/hodljuice stop
 ```
 
-During development, use `./bin/hodljuice` instead of `hodljuice`.
+## Architecture and project status
 
-## Requirements
+The QML layer is intentionally thin. Discovery, persistence, `mpv` IPC, and spectrum analysis live in the separately testable Python CLI.
 
-Current:
+- [`docs/development-status.md`](docs/development-status.md) — implemented and remaining work
+- [`docs/implementation-plan.md`](docs/implementation-plan.md) — product and architecture plan
+- [`docs/spectrum.md`](docs/spectrum.md) — real-signal design and validation
 
-- Omarchy 4.0+
-- Python 3.11+
-- `mpv`
-- network access to `https://hodljuice.app`
+Known pre-release work includes a recent-history panel, explicit MPRIS validation, analyzer performance measurements, and eventually deciding whether to reintroduce category, people, and calendar-year filters.
 
-Development tests also use Node.js and `jq`, both present on standard Omarchy installations.
+## Privacy
 
-## Privacy and local data
-
-HodlJuice has no accounts, analytics, advertising, or telemetry. It contacts `https://hodljuice.app` for discovery and the episode audio hosts returned by that service for playback. It does not load remote artwork in the current UI. Saved episodes, history, resume positions, and current playback metadata stay under `$XDG_STATE_HOME/hodljuice` (normally `~/.local/state/hodljuice`). Runtime control files stay under `$XDG_RUNTIME_DIR/hodljuice` with user-only permissions.
+HodlJuice has no accounts, analytics, advertising, or telemetry. It contacts `hodljuice.app` for discovery and the episode audio hosts returned by that service for playback. Remote artwork is not loaded by the current UI.
 
 ## License
 
-MIT
+[MIT](LICENSE)
