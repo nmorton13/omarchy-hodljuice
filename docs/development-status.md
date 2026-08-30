@@ -13,7 +13,7 @@
 - [x] Filter URL builder
 - [x] `mpv` JSON IPC bootstrap and basic controls
 - [x] Retune-to-autoplay with bounded recovery for unavailable episodes
-- [x] Playback status polling, progress, duration, and remaining time
+- [x] Event-driven playback status watch (replaces per-second polling), progress, duration, and remaining time
 - [x] Per-process PipeWire capture using the named `hodljuice` mpv node
 - [x] Real 21-band voice-responsive analyzer and QML stream
 - [x] Keyboard-first range tuner with Any Time, Last 7 Days, and Last 30 Days filters
@@ -29,7 +29,7 @@
 1. Add a panel view for recent discovery history.
 2. Decide when category, people, and calendar-year filters are ready to return to the UI.
 3. Complete MPRIS behavior and media-key validation.
-4. Tune spectrum normalization across varied podcast feeds and measure CPU/memory.
+4. Tune spectrum normalization across varied podcast feeds and measure CPU/memory (status polling is now a persistent event-driven watch; the live analyzer is the main steady-state cost).
 5. Decide whether theme-dithered artwork improves the receiver or adds noise.
 
 ## Explicitly incomplete

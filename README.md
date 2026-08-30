@@ -125,6 +125,7 @@ The QML plugin invokes its bundled CLI directly. During development, use `./bin/
 
 ```bash
 ./bin/hodljuice status
+./bin/hodljuice watch
 ./bin/hodljuice current
 ./bin/hodljuice toggle
 ./bin/hodljuice seek -30

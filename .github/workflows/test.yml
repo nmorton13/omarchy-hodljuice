@@ -19,6 +19,10 @@ jobs:
         with:
           node-version: "22"
       - name: Install test dependencies
-        run: sudo apt-get update && sudo apt-get install -y jq
+        run: sudo apt-get update && sudo apt-get install -y jq qt6-declarative-dev-tools
+      - name: Add Qt tools to PATH
+        run: echo "/usr/lib/qt6/bin" >> "$GITHUB_PATH"
       - name: Run validation
         run: ./tests/run.sh
+      - name: Lint QML (reduced import paths; unresolved qs.*/Quickshell imports are expected)
+        run: qmllint BarWidget.qml Panel.qml components/*.qml

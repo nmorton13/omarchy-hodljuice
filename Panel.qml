@@ -29,7 +29,7 @@ Panel {
   property string playbackState: "idle"
   property string errorMessage: ""
   property string band: settings && settings.band ? String(settings.band) : "all"
-  property string range: settings && settings.range ? String(settings.range) : "any"
+  property string range: settings && settings.range ? String(settings.range) : Model.DEFAULT_RANGE
   property string person: settings && settings.person ? String(settings.person) : ""
   property var signalBands: Model.normalizeBands([])
   property real positionSeconds: 0
@@ -64,6 +64,8 @@ Panel {
   ]
 
   readonly property int panelWidth: Style.space(440)
+  readonly property real savedRowHeight: Style.space(58)
+  readonly property real savedRowSpacing: Style.space(5)
 
   function localPath(relativePath) {
     var url = Qt.resolvedUrl(relativePath).toString()
@@ -109,7 +111,7 @@ Panel {
       viewMode = "receiver"
     } else {
       pendingBand = "all"
-      pendingRange = ["any", "7", "30"].indexOf(range) >= 0 ? range : "any"
+      pendingRange = Model.normalizeRange(range)
       pendingPerson = ""
       tunerIndex = 0
       viewMode = "tuner"
@@ -139,7 +141,7 @@ Panel {
   function choosePerson(index) {
     if (index < 0 || index >= peopleOptions.length) return
     pendingBand = "people"
-    pendingRange = "any"
+    pendingRange = Model.DEFAULT_RANGE
     pendingPerson = String(peopleOptions[index].value)
     viewMode = "tuner"
   }
@@ -186,8 +188,8 @@ Panel {
   function ensureSavedVisible() {
     if (viewMode !== "saved") return
     Qt.callLater(function() {
-      var rowTop = savedList.y + savedIndex * Style.space(63)
-      var rowBottom = rowTop + Style.space(58)
+      var rowTop = savedList.y + savedIndex * (root.savedRowHeight + root.savedRowSpacing)
+      var rowBottom = rowTop + root.savedRowHeight
       if (rowTop < contentFlickable.contentY)
         contentFlickable.contentY = Math.max(0, rowTop)
       else if (rowBottom > contentFlickable.contentY + contentFlickable.height)
@@ -233,7 +235,11 @@ Panel {
   }
 
   function checkResume() {
-    if (!episode || !episode.audioUrl || resumeProcess.running) return
+    if (!episode || !episode.audioUrl) return
+    if (resumeProcess.running) {
+      Qt.callLater(root.checkResume)
+      return
+    }
     resumeProcess.command = cliCommand(["resume", "--url", String(episode.audioUrl)])
     resumeProcess.running = true
   }
@@ -297,10 +303,7 @@ Panel {
 
   function playCurrent() {
     if (!episode || !episode.audioUrl) return
-    if (statusProcess.running) {
-      statusProcess.gotStatus = true
-      statusProcess.running = false
-    }
+    if (watchProcess.running) watchProcess.running = false
     playbackState = "buffering"
     playProcess.command = cliCommand([
       "play",
@@ -313,7 +316,7 @@ Panel {
   }
 
   function togglePlayback() {
-    if (playbackState === "loading" || playbackState === "buffering") return
+    if (playbackState === "loading" || playbackState === "buffering" || controlProcess.running) return
     if (!episode) { retune(); return }
     if (playbackState === "idle" || playbackState === "error") { playCurrent(); return }
     controlProcess.command = cliCommand(["toggle"])
@@ -328,11 +331,16 @@ Panel {
     positionSeconds = Math.max(0, Math.min(durationSeconds || Number.MAX_VALUE, positionSeconds + seconds))
   }
 
-  function pollStatus() {
-    if (!statusProcess.running && ["buffering", "playing", "paused"].indexOf(playbackState) >= 0) {
-      statusProcess.gotStatus = false
-      statusProcess.command = cliCommand(["status"])
-      statusProcess.running = true
+  function syncWatch() {
+    if (["playing", "paused"].indexOf(playbackState) >= 0) {
+      if (!watchProcess.running) {
+        watchProcess.command = cliCommand(["watch"])
+        watchProcess.running = true
+      }
+    } else {
+      watchRetry.stop()
+      statusFailureCount = 0
+      if (watchProcess.running) watchProcess.running = false
     }
   }
 
@@ -386,9 +394,12 @@ Panel {
   }
 
   onOpenedChanged: if (opened) Qt.callLater(function() { keyCatcher.forceActiveFocus() })
-  onPlaybackStateChanged: Qt.callLater(root.syncSpectrum)
+  onPlaybackStateChanged: {
+    Qt.callLater(root.syncSpectrum)
+    Qt.callLater(root.syncWatch)
+  }
   Component.onCompleted: {
-    var supportedRange = ["any", "7", "30"].indexOf(range) >= 0 ? range : "any"
+    var supportedRange = Model.normalizeRange(range)
     if (band !== "all" || person !== "" || supportedRange !== range) {
       band = "all"
       range = supportedRange
@@ -428,7 +439,7 @@ Panel {
     function all(): string {
       root.open()
       root.pendingBand = "all"
-      root.pendingRange = "any"
+      root.pendingRange = Model.DEFAULT_RANGE
       root.pendingPerson = ""
       root.applyTuning()
       return "ok"
@@ -437,7 +448,7 @@ Panel {
       if (!value) return "missing person"
       root.open()
       root.pendingBand = "people"
-      root.pendingRange = "any"
+      root.pendingRange = Model.DEFAULT_RANGE
       root.pendingPerson = value
       root.applyTuning()
       return "ok"
@@ -459,11 +470,10 @@ Panel {
   }
 
   Timer {
-    interval: 1000
-    running: ["buffering", "playing", "paused"].indexOf(root.playbackState) >= 0
-    repeat: true
-    triggeredOnStart: true
-    onTriggered: root.pollStatus()
+    id: watchRetry
+    interval: Math.min(30000, 1200 * Math.pow(2, Math.min(root.statusFailureCount, 5)))
+    repeat: false
+    onTriggered: root.syncWatch()
   }
 
   Timer {
@@ -504,9 +514,10 @@ Panel {
       }
     }
     onExited: function() {
-      statusProcess.gotStatus = false
-      statusProcess.command = root.cliCommand(["status"])
-      statusProcess.running = true
+      if (!watchProcess.running) {
+        watchProcess.command = root.cliCommand(["watch"])
+        watchProcess.running = true
+      }
     }
   }
 
@@ -691,15 +702,12 @@ Panel {
   }
 
   Process {
-    id: statusProcess
-    property bool gotStatus: false
+    id: watchProcess
     command: []
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var status = Model.parsePlaybackStatus(text)
+    stdout: SplitParser {
+      onRead: function(line) {
+        var status = Model.parsePlaybackStatus(line)
         if (!status) return
-        statusProcess.gotStatus = true
         root.statusFailureCount = 0
         if (root.playbackState === "loading") return
         root.playbackState = status.playback === "stopped" ? "idle" : status.playback
@@ -708,12 +716,15 @@ Panel {
         if (status.volume !== null) root.playbackVolume = status.volume
       }
     }
-    onExited: function(exitCode) {
-      if (gotStatus) return
-      root.statusFailureCount++
-      if (root.statusFailureCount >= 3) {
-        root.playbackState = "error"
-        root.errorMessage = "Playback stopped responding. Press Play to reconnect."
+    onExited: function() {
+      if (["playing", "paused"].indexOf(root.playbackState) >= 0) {
+        root.statusFailureCount++
+        if (root.statusFailureCount >= 3) {
+          root.playbackState = "error"
+          root.errorMessage = "Playback stopped responding. Press Play to reconnect."
+        } else {
+          watchRetry.restart()
+        }
       }
     }
   }
@@ -730,8 +741,6 @@ Panel {
       if (exitCode !== 0) {
         root.playbackState = "error"
         root.errorMessage = "The playback command failed."
-      } else {
-        root.pollStatus()
       }
     }
   }
@@ -1077,7 +1086,7 @@ Panel {
               id: savedList
               visible: !root.savedLoading && root.savedEpisodes.length > 0
               width: parent.width
-              spacing: Style.space(5)
+              spacing: root.savedRowSpacing
 
               Repeater {
                 model: root.savedEpisodes
@@ -1216,7 +1225,7 @@ Panel {
     signal triggered()
     signal removeRequested()
 
-    height: Style.space(58)
+    height: root.savedRowHeight
     radius: Style.cornerRadius
     color: selected || savedMouse.containsMouse
       ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.16)

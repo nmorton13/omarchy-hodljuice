@@ -1,9 +1,13 @@
+import contextlib
 import importlib.machinery
 import importlib.util
+import io
+import json
 import math
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -94,6 +98,32 @@ class PersistenceTests(unittest.TestCase):
         MODULE.remember_position(url, 3)
         self.assertEqual(MODULE.resume_position(url), 0)
 
+    def test_positions_prune_entries_older_than_max_age(self):
+        url = "https://media.example/e.mp3"
+        old_url = "https://media.example/old.mp3"
+        now = int(time.time())
+        MODULE.remember_position(url, 100)
+        path = MODULE.xdg_state_dir() / "positions.json"
+        values = MODULE.read_json_file(path, {})
+        values[old_url] = {"seconds": 50, "updatedAt": now - MODULE.POSITIONS_MAX_AGE_SECONDS - 1}
+        MODULE.atomic_json_write(path, values)
+        MODULE.remember_position(url, 200)
+        values = MODULE.read_json_file(path, {})
+        self.assertNotIn(old_url, values)
+        self.assertIn(url, values)
+
+    def test_positions_cap_total_entries(self):
+        now = int(time.time())
+        path = MODULE.xdg_state_dir() / "positions.json"
+        values = {}
+        for index in range(MODULE.POSITIONS_LIMIT + 50):
+            values[f"https://media.example/e{index}.mp3"] = {"seconds": 10 + index, "updatedAt": now - index}
+        MODULE.atomic_json_write(path, values)
+        MODULE.remember_position("https://media.example/new.mp3", 100)
+        values = MODULE.read_json_file(path, {})
+        self.assertLessEqual(len(values), MODULE.POSITIONS_LIMIT)
+        self.assertIn("https://media.example/new.mp3", values)
+
     def test_state_files_are_private(self):
         path = MODULE.xdg_state_dir() / "private.json"
         MODULE.atomic_json_write(path, {"ok": True})
@@ -177,6 +207,112 @@ class PlaybackTests(unittest.TestCase):
         ):
             self.assertEqual(MODULE.mpv_command(["get_property", "time-pos"]), 42)
 
+    @staticmethod
+    def refused_error(command):
+        try:
+            raise ConnectionRefusedError(111, "Connection refused")
+        except ConnectionRefusedError as error:
+            raise MODULE.HodlJuiceError(f"Unable to control playback: {error}") from error
+
+    def test_status_reports_stopped_for_stale_socket(self):
+        socket_path = Path(self.temp.name) / "mpv.sock"
+        socket_path.touch()
+        with mock.patch.object(MODULE, "mpv_socket_path", return_value=socket_path), mock.patch.object(
+            MODULE, "mpv_command", side_effect=self.refused_error
+        ):
+            status = MODULE.playback_status()
+        self.assertEqual(status, {"schemaVersion": 1, "playback": "stopped"})
+        self.assertFalse(socket_path.exists())
+
+    def test_status_propagates_other_mpv_errors(self):
+        socket_path = Path(self.temp.name) / "mpv.sock"
+        socket_path.touch()
+        with mock.patch.object(MODULE, "mpv_socket_path", return_value=socket_path), mock.patch.object(
+            MODULE, "mpv_command", side_effect=MODULE.HodlJuiceError("mpv command failed: property not found")
+        ):
+            with self.assertRaises(MODULE.HodlJuiceError):
+                MODULE.playback_status()
+        self.assertTrue(socket_path.exists())
+
+    def test_watch_reports_stopped_without_socket(self):
+        socket_path = Path(self.temp.name) / "mpv.sock"
+        with mock.patch.object(MODULE, "mpv_socket_path", return_value=socket_path):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                MODULE.watch_status()
+        self.assertEqual(json.loads(output.getvalue()), {"schemaVersion": 1, "playback": "stopped"})
+
+    def test_watch_unlinks_stale_socket_and_reports_stopped(self):
+        socket_path = Path(self.temp.name) / "mpv.sock"
+        socket_path.touch()
+
+        class RefusedSocket:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def connect(self, path):
+                raise ConnectionRefusedError(111, "Connection refused")
+
+        with mock.patch.object(MODULE, "mpv_socket_path", return_value=socket_path), mock.patch.object(
+            MODULE.socket, "socket", return_value=RefusedSocket()
+        ):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                MODULE.watch_status()
+        self.assertFalse(socket_path.exists())
+        self.assertEqual(json.loads(output.getvalue()), {"schemaVersion": 1, "playback": "stopped"})
+
+    def test_watch_streams_property_changes(self):
+        socket_path = Path(self.temp.name) / "mpv.sock"
+        socket_path.touch()
+
+        class FakeSocket:
+            def __init__(self, chunks):
+                self.chunks = list(chunks)
+                self.sent = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def connect(self, path):
+                pass
+
+            def sendall(self, data):
+                self.sent.append(data)
+
+            def recv(self, size):
+                if not self.chunks:
+                    return b""
+                return self.chunks.pop(0)
+
+        chunks = [
+            b'{"event":"property-change","id":1,"name":"pause","data":false}\n'
+            b'{"event":"property-change","id":2,"name":"time-pos","data":12.5}\n'
+            b'{"event":"property-change","id":3,"name":"duration","data":60.0}\n'
+            b'{"event":"property-change","id":4,"name":"volume","data":70}\n'
+            b'{"event":"property-change","id":5,"name":"idle-active","data":false}\n'
+            b'{"event":"property-change","id":1,"name":"pause","data":true}\n',
+            b"",
+        ]
+        with mock.patch.object(MODULE, "mpv_socket_path", return_value=socket_path), mock.patch.object(
+            MODULE.socket, "socket", return_value=FakeSocket(chunks)
+        ):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                MODULE.watch_status()
+        lines = [json.loads(line) for line in output.getvalue().strip().splitlines()]
+        self.assertEqual(lines[0]["playback"], "playing")
+        self.assertEqual(lines[0]["position"], 12.5)
+        self.assertEqual(lines[0]["duration"], 60.0)
+        self.assertEqual(lines[1]["playback"], "paused")
+        self.assertEqual(lines[-1]["playback"], "stopped")
+
 
 class PeopleParserTests(unittest.TestCase):
     def test_extracts_people_options(self):
@@ -235,6 +371,42 @@ class EpisodeParserTests(unittest.TestCase):
         document = '<div class="episode-info-mappapi" data-title="x" data-podcast-name="y" data-audio-url="file:///tmp/x"></div>'
         with self.assertRaises(MODULE.HodlJuiceError):
             MODULE.parse_episode(document, "https://hodljuice.app/")
+
+    def test_date_span_inside_paragraph_does_not_hijack_capture(self):
+        document = (
+            '<div class="episode-info-mappapi" data-title="T" data-podcast-name="P" data-audio-url="https://media.example.test/a.mp3"></div>'
+            '<div class="podcast-info-container"><p>by: Artist <span class="episode-date-text">2020-01-07</span> more</p></div>'
+        )
+        episode = MODULE.parse_episode(document, "https://hodljuice.app/")
+        self.assertEqual(episode.artist, "Artist 2020-01-07 more")
+        self.assertEqual(episode.publishedAt, "")
+
+
+class FetchDocumentTests(unittest.TestCase):
+    def test_redirect_to_foreign_host_is_rejected(self):
+        import http.server
+        import threading
+
+        class RedirectHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(302)
+                self.send_header("Location", "https://evil.example/steal")
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), RedirectHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            with self.assertRaises(MODULE.HodlJuiceError) as context:
+                MODULE.fetch_document(f"http://127.0.0.1:{port}/", timeout=5)
+            self.assertIn("redirected", str(context.exception))
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
 
 
 if __name__ == "__main__":

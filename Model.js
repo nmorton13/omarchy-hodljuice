@@ -1,8 +1,12 @@
 .pragma library
 
 var BAND_COUNT = 21
-var VALID_BANDS = ["all", "humanitarian", "climate_energy", "video", "money", "people"]
 var VALID_RANGES = ["any", "7", "30"]
+var DEFAULT_RANGE = "any"
+
+function normalizeRange(value) {
+  return VALID_RANGES.indexOf(value) >= 0 ? value : DEFAULT_RANGE
+}
 
 function finiteNumber(value) {
   if (value === null || value === undefined || value === "") return null
@@ -105,6 +109,8 @@ function formatClock(seconds) {
   return hours > 0 ? hours + ":" + pad(minutes) + ":" + pad(remainder) : minutes + ":" + pad(remainder)
 }
 
+// Retained for the not-yet-restored category/people filters; the current tuner
+// only exposes time ranges, which filterLabel() covers.
 function bandLabel(value) {
   switch (String(value || "all")) {
   case "humanitarian": return "HUMAN RIGHTS"
@@ -114,15 +120,6 @@ function bandLabel(value) {
   case "people": return "PEOPLE"
   default: return "ALL BITCOIN"
   }
-}
-
-function rangeLabel(value) {
-  var text = String(value || "any")
-  if (text === "7") return "7D"
-  if (text === "30") return "30D"
-  if (/^\d{4}$/.test(text)) return text
-  if (/^\d{4}-\d{2}-\d{2}$/.test(text)) return text
-  return "ANY TIME"
 }
 
 function compactSignal(values, active) {

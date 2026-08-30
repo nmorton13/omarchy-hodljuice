@@ -9,18 +9,14 @@ from __future__ import annotations
 
 import argparse
 import array
-import html
 import json
 import math
 import os
 import socket
 import subprocess
 import sys
-import tempfile
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from dataclasses import asdict, dataclass
 from html.parser import HTMLParser
 from pathlib import Path
@@ -108,7 +104,9 @@ class EpisodeParser(HTMLParser):
         if self.info_depth and tag in {"h1", "h3", "p"} and self.capture_tag is None:
             self.capture_tag = tag
             self.capture_parts = []
-        if self.info_depth and tag == "span" and "episode-date-text" in classes:
+        if self.info_depth and tag == "span" and "episode-date-text" in classes and (
+            self.capture_tag is None or (self.capture_tag == "p" and not self.capture_parts)
+        ):
             self.capture_tag = "date-span"
             self.capture_parts = []
         if tag == "source" and not self.audio_url:
@@ -184,6 +182,8 @@ def build_discovery_url(
 
 
 def parse_episode(document: str, source_url: str) -> Episode:
+    import html
+
     parser = EpisodeParser()
     parser.feed(document)
     metadata = parser.metadata or {}
@@ -214,9 +214,24 @@ def parse_episode(document: str, source_url: str) -> Episode:
 
 
 def fetch_document(url: str, timeout: float = 18.0) -> str:
+    import urllib.error
+    import urllib.request
+
+    class _HodlJuiceRedirectHandler(urllib.request.HTTPRedirectHandler):
+        """Refuse redirects away from the fixed HodlJuice origin."""
+
+        def redirect_request(self, request, fp, code, msg, headers, newurl):
+            new_request = super().redirect_request(request, fp, code, msg, headers, newurl)
+            if new_request is None:
+                return None
+            if urllib.parse.urlparse(new_request.full_url).netloc != urllib.parse.urlparse(BASE_URL).netloc:
+                raise HodlJuiceError("HodlJuice redirected to an unexpected host")
+            return new_request
+
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html"})
+    opener = urllib.request.build_opener(_HodlJuiceRedirectHandler())
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with opener.open(request, timeout=timeout) as response:
             declared_size = response.headers.get("Content-Length")
             try:
                 response_size = int(declared_size) if declared_size else None
@@ -275,6 +290,8 @@ def read_json_file(path: Path, fallback: Any) -> Any:
 
 def atomic_json_write(path: Path, value: Any) -> None:
     """Write private state without exposing a partial file or shared temp name."""
+    import tempfile
+
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary = Path(temporary_name)
@@ -345,6 +362,23 @@ def remove_saved_episode(url: str) -> None:
     atomic_json_write(path, [item for item in current if isinstance(item, dict) and item.get("audioUrl") != url])
 
 
+POSITIONS_MAX_AGE_SECONDS = 90 * 24 * 60 * 60
+POSITIONS_LIMIT = 200
+
+
+def prune_positions(values: dict[str, Any], now: int | None = None) -> dict[str, Any]:
+    """Drop stale and excess position entries so the file stays bounded."""
+    now = int(time.time()) if now is None else now
+    cutoff = now - POSITIONS_MAX_AGE_SECONDS
+    fresh = {
+        url: entry
+        for url, entry in values.items()
+        if isinstance(entry, dict) and tolerant_int(entry.get("updatedAt", 0)) >= cutoff
+    }
+    ordered = sorted(fresh.items(), key=lambda item: tolerant_int(item[1].get("updatedAt", 0)), reverse=True)
+    return dict(ordered[:POSITIONS_LIMIT])
+
+
 def remember_position(url: str, seconds: float) -> None:
     if not _http_url(url):
         raise HodlJuiceError("Position requires a valid episode URL")
@@ -355,7 +389,7 @@ def remember_position(url: str, seconds: float) -> None:
         values.pop(url, None)
     else:
         values[url] = {"seconds": round(max(0.0, seconds), 3), "updatedAt": int(time.time())}
-    atomic_json_write(path, values)
+    atomic_json_write(path, prune_positions(values))
 
 
 def resume_position(url: str) -> float:
@@ -500,18 +534,104 @@ def start_playback(url: str, title: str, artist: str, start: float = 0.0) -> Non
 
 
 def playback_status() -> dict[str, Any]:
-    if not mpv_socket_path().exists():
+    path = mpv_socket_path()
+    if not path.exists():
         return {"schemaVersion": 1, "playback": "stopped"}
-    if bool(mpv_command(["get_property", "idle-active"])):
-        return {"schemaVersion": 1, "playback": "stopped"}
-    paused = bool(mpv_command(["get_property", "pause"]))
-    return {
+    try:
+        if bool(mpv_command(["get_property", "idle-active"])):
+            return {"schemaVersion": 1, "playback": "stopped"}
+        paused = bool(mpv_command(["get_property", "pause"]))
+        return {
+            "schemaVersion": 1,
+            "playback": "paused" if paused else "playing",
+            "position": mpv_command(["get_property", "time-pos"]),
+            "duration": mpv_command(["get_property", "duration"]),
+            "volume": mpv_command(["get_property", "volume"]),
+        }
+    except HodlJuiceError as error:
+        if isinstance(error.__cause__, (ConnectionRefusedError, FileNotFoundError)):
+            path.unlink(missing_ok=True)
+            return {"schemaVersion": 1, "playback": "stopped"}
+        raise
+
+
+def watch_status() -> None:
+    """Stream playback status changes as JSON lines until mpv stops or the socket dies."""
+    path = mpv_socket_path()
+    if not path.exists():
+        print(json.dumps({"schemaVersion": 1, "playback": "stopped"}), flush=True)
+        return
+    state: dict[str, Any] = {
         "schemaVersion": 1,
-        "playback": "paused" if paused else "playing",
-        "position": mpv_command(["get_property", "time-pos"]),
-        "duration": mpv_command(["get_property", "duration"]),
-        "volume": mpv_command(["get_property", "volume"]),
+        "playback": "stopped",
+        "position": None,
+        "duration": None,
+        "volume": None,
     }
+    idle = True
+    paused = False
+    idle_seen = False
+    last_position_emit = 0.0
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.connect(str(path))
+            for property_id, name in enumerate(("pause", "time-pos", "duration", "volume", "idle-active"), start=1):
+                client.sendall(
+                    json.dumps({"command": ["observe_property", property_id, name], "request_id": property_id}).encode() + b"\n"
+                )
+            pending = b""
+            while True:
+                chunk = client.recv(65536)
+                if not chunk:
+                    break
+                pending += chunk
+                if len(pending) > 1024 * 1024:
+                    raise HodlJuiceError("mpv response exceeded the size limit")
+                while b"\n" in pending:
+                    line, pending = pending.split(b"\n", 1)
+                    if not line:
+                        continue
+                    try:
+                        value = json.loads(line)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        continue
+                    if not isinstance(value, dict) or value.get("event") != "property-change":
+                        continue
+                    name = value.get("name")
+                    data = value.get("data")
+                    if name == "idle-active":
+                        idle = bool(data)
+                        idle_seen = True
+                    elif name == "pause":
+                        paused = bool(data)
+                    elif name == "time-pos":
+                        state["position"] = data
+                        now = time.monotonic()
+                        if now - last_position_emit < 0.25:
+                            continue
+                        last_position_emit = now
+                    elif name == "duration":
+                        state["duration"] = data
+                    elif name == "volume":
+                        state["volume"] = data
+                    else:
+                        continue
+                    if not idle_seen:
+                        continue
+                    state["playback"] = "stopped" if idle else ("paused" if paused else "playing")
+                    print(json.dumps(state, separators=(",", ":")), flush=True)
+                    if idle:
+                        return
+        if state["playback"] != "stopped" or not idle_seen:
+            state["playback"] = "stopped"
+            print(json.dumps(state, separators=(",", ":")), flush=True)
+    except BrokenPipeError:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+    except OSError as error:
+        if isinstance(error, (ConnectionRefusedError, FileNotFoundError, ConnectionResetError)):
+            path.unlink(missing_ok=True)
+        print(json.dumps({"schemaVersion": 1, "playback": "stopped"}), flush=True)
 
 
 def spectrum_centers() -> list[float]:
@@ -633,6 +753,7 @@ def build_parser() -> argparse.ArgumentParser:
     seek = subparsers.add_parser("seek", help="seek by a relative number of seconds")
     seek.add_argument("seconds", type=float)
     subparsers.add_parser("status", help="show playback status as JSON")
+    subparsers.add_parser("watch", help="stream playback status changes as JSON lines")
     subparsers.add_parser("current", help="show the last played episode as JSON")
     subparsers.add_parser("stop", help="stop playback")
     spectrum = subparsers.add_parser("spectrum", help="stream the 21-band playback signal as JSON lines")
@@ -693,6 +814,8 @@ def main(argv: list[str] | None = None) -> int:
             mpv_command(["seek", args.seconds, "relative"])
         elif args.command == "status":
             print(json.dumps(playback_status(), ensure_ascii=False))
+        elif args.command == "watch":
+            watch_status()
         elif args.command == "current":
             print(json.dumps(read_json_file(xdg_state_dir() / "current.json", {}), ensure_ascii=False))
         elif args.command == "stop":

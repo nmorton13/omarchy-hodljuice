@@ -44,8 +44,8 @@ A live muted-output test produced real program audio with RMS around 3,800 and p
 
 `bin/hodljuice spectrum`:
 
-- reads 512 mono signed 16-bit samples per frame
-- updates at approximately 31.25 frames per second
+- reads 640 mono signed 16-bit samples per frame
+- updates at approximately 25 frames per second
 - applies a Hann window
 - evaluates 21 logarithmically spaced centers from 90 Hz to 7.6 kHz
 - converts magnitude to dB and normalizes it to `[0, 1]`

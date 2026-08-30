@@ -3,7 +3,7 @@
   "id": "nmorton.hodljuice",
   "name": "HodlJuice",
   "version": "0.1.0-dev",
-  "author": "Nick Morton",
+  "author": "Nathan Morton",
   "license": "MIT",
   "description": "A theme-native Bitcoin podcast broadcast receiver with random discovery and a live voice signal",
   "kinds": ["bar-widget"],
