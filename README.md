@@ -41,7 +41,7 @@ Pointer controls are available for every primary action. On the bar, left click 
 Once this repository is published, install it with its Git URL:
 
 ```bash
-omarchy plugin add https://github.com/OWNER/REPOSITORY.git --enable
+omarchy plugin add https://github.com/nmorton13/omarchy-hodljuice.git --enable
 ```
 
 The widget defaults to the center section. Move it at any time with:
