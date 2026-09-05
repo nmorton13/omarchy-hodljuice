@@ -600,10 +600,21 @@ def shutdown_playback(timeout: float = 2.0) -> None:
         raise HodlJuiceError(f"Unable to stop playback: {error}") from error
 
     deadline = time.monotonic() + timeout
-    while path.exists() and time.monotonic() < deadline:
+    while time.monotonic() < deadline:
+        if not path.exists():
+            return
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                probe.settimeout(0.1)
+                probe.connect(str(path))
+        except ConnectionRefusedError:
+            # mpv exited but left a stale socket behind; clean it up.
+            path.unlink(missing_ok=True)
+            return
+        except OSError:
+            pass
         time.sleep(0.04)
-    if path.exists():
-        raise HodlJuiceError("Timed out waiting for playback to stop")
+    raise HodlJuiceError("Timed out waiting for playback to stop")
 
 
 def playback_status() -> dict[str, Any]:

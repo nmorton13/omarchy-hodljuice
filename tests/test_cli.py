@@ -199,6 +199,23 @@ class PlaybackTests(unittest.TestCase):
         command = json.loads(client.sendall.call_args.args[0])
         self.assertEqual(command, {"command": ["quit"]})
 
+    def test_shutdown_cleans_up_stale_socket_left_by_exited_mpv(self):
+        socket_path = Path(self.temp.name) / "mpv.sock"
+        socket_path.touch()
+
+        client = mock.MagicMock()
+        client.__enter__.return_value = client
+        client.sendall.side_effect = lambda payload: None
+        # First connect (quit) succeeds; the wait-loop probe connect hits a
+        # stale socket and is refused, as mpv does after exiting.
+        client.connect.side_effect = [None, ConnectionRefusedError]
+        with mock.patch.object(MODULE, "mpv_socket_path", return_value=socket_path), mock.patch.object(
+            MODULE.socket, "socket", return_value=client
+        ):
+            MODULE.shutdown_playback()
+
+        self.assertFalse(socket_path.exists())
+
     def test_wait_for_media_retries_resume_seek_until_load_is_ready(self):
         seek_attempts = 0
         unpaused = False
