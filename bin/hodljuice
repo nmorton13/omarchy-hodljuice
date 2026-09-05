@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import array
+import ipaddress
 import json
 import math
 import os
@@ -142,6 +143,52 @@ def _http_url(value: str, *, allow_relative: bool = False) -> str:
     return value
 
 
+def _origin(value: str) -> tuple[str, str, int] | None:
+    """Return a normalized HTTP origin, including its effective port."""
+    try:
+        parsed = urllib.parse.urlparse(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return None
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError:
+        return None
+    return parsed.scheme, parsed.hostname.lower(), port
+
+
+def _same_origin(value: str, expected: str = BASE_URL) -> bool:
+    return _origin(value) == _origin(expected)
+
+
+def public_playback_url(value: str) -> str:
+    """Reject playback destinations that resolve outside the public Internet."""
+    url = _http_url(value)
+    if not url:
+        raise HodlJuiceError("Playback requires a valid HTTP(S) audio URL")
+
+    parsed = urllib.parse.urlparse(url)
+    assert parsed.hostname is not None
+    try:
+        addresses = socket.getaddrinfo(
+            parsed.hostname,
+            parsed.port or (443 if parsed.scheme == "https" else 80),
+            type=socket.SOCK_STREAM,
+        )
+    except (OSError, ValueError) as error:
+        raise HodlJuiceError("The podcast host could not be resolved safely") from error
+
+    if not addresses:
+        raise HodlJuiceError("The podcast host could not be resolved safely")
+    for address in addresses:
+        try:
+            candidate = ipaddress.ip_address(address[4][0])
+        except (ValueError, IndexError) as error:
+            raise HodlJuiceError("The podcast host returned an invalid address") from error
+        mapped = getattr(candidate, "ipv4_mapped", None)
+        if not candidate.is_global or (mapped is not None and not mapped.is_global):
+            raise HodlJuiceError("Playback from local or private network addresses is not allowed")
+    return url
+
+
 def build_discovery_url(
     band: str = "all",
     range_value: str = "any",
@@ -221,10 +268,12 @@ def fetch_document(url: str, timeout: float = 18.0) -> str:
         """Refuse redirects away from the fixed HodlJuice origin."""
 
         def redirect_request(self, request, fp, code, msg, headers, newurl):
+            if not _same_origin(newurl):
+                raise HodlJuiceError("HodlJuice redirected to an unexpected host")
             new_request = super().redirect_request(request, fp, code, msg, headers, newurl)
             if new_request is None:
                 return None
-            if urllib.parse.urlparse(new_request.full_url).netloc != urllib.parse.urlparse(BASE_URL).netloc:
+            if not _same_origin(new_request.full_url):
                 raise HodlJuiceError("HodlJuice redirected to an unexpected host")
             return new_request
 
@@ -485,9 +534,7 @@ def wait_for_media_ready(url: str, start: float = 0.0, timeout: float = 12.0) ->
 
 
 def start_playback(url: str, title: str, artist: str, start: float = 0.0) -> None:
-    url = _http_url(url)
-    if not url:
-        raise HodlJuiceError("Playback requires a valid HTTP(S) audio URL")
+    url = public_playback_url(url)
     path = mpv_socket_path()
     reused_process = False
     if path.exists():
@@ -511,6 +558,8 @@ def start_playback(url: str, title: str, artist: str, start: float = 0.0) -> Non
                     "--force-window=no",
                     "--terminal=no",
                     "--really-quiet",
+                    "--access-references=no",
+                    "--ytdl=no",
                     "--input-ipc-server=" + str(path),
                     "--audio-client-name=hodljuice",
                     "--force-media-title=" + title,
@@ -531,6 +580,30 @@ def start_playback(url: str, title: str, artist: str, start: float = 0.0) -> Non
         xdg_state_dir() / "current.json",
         {"schemaVersion": 1, "audioUrl": url, "title": title, "artist": artist, "updatedAt": int(time.time())},
     )
+
+
+def shutdown_playback(timeout: float = 2.0) -> None:
+    """Terminate the detached HodlJuice mpv process, if one is running."""
+    path = mpv_socket_path()
+    if not path.exists():
+        return
+    payload = json.dumps({"command": ["quit"]}).encode() + b"\n"
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(timeout)
+            client.connect(str(path))
+            client.sendall(payload)
+    except (ConnectionRefusedError, FileNotFoundError):
+        path.unlink(missing_ok=True)
+        return
+    except OSError as error:
+        raise HodlJuiceError(f"Unable to stop playback: {error}") from error
+
+    deadline = time.monotonic() + timeout
+    while path.exists() and time.monotonic() < deadline:
+        time.sleep(0.04)
+    if path.exists():
+        raise HodlJuiceError("Timed out waiting for playback to stop")
 
 
 def playback_status() -> dict[str, Any]:
@@ -819,7 +892,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "current":
             print(json.dumps(read_json_file(xdg_state_dir() / "current.json", {}), ensure_ascii=False))
         elif args.command == "stop":
-            mpv_command(["stop"])
+            shutdown_playback()
         elif args.command == "spectrum":
             stream_spectrum(args.target, max(0, args.frames))
         elif args.command == "doctor":

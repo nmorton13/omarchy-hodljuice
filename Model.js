@@ -18,6 +18,17 @@ function clamp(value, minimum, maximum) {
   return Math.max(minimum, Math.min(maximum, value))
 }
 
+function safeLabel(value, maximumLength) {
+  var limit = finiteNumber(maximumLength)
+  if (limit === null || limit < 1) limit = 80
+  return String(value || "")
+    .replace(/[<>]/g, function(character) { return character === "<" ? "‹" : "›" })
+    .replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, Math.floor(limit))
+}
+
 function normalizeBands(values) {
   var result = []
   var source = Array.isArray(values) ? values : []

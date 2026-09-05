@@ -39,6 +39,7 @@ Panel {
   property bool saved: false
   property bool autoplayPending: false
   property bool recoverWithRetune: true
+  property bool retuneWaitingForStop: false
   property int automaticRetuneAttempts: 0
   readonly property int maximumAutomaticRetunes: 3
   property int tuningFrame: 0
@@ -207,17 +208,22 @@ Panel {
     retune()
   }
 
+  function beginDiscovery() {
+    var argumentsList = ["discover", "--band", band, "--range", range]
+    if (band === "people" && person) argumentsList = argumentsList.concat(["--person", person])
+    argumentsList.push("--json")
+    discoverProcess.command = cliCommand(argumentsList)
+    discoverProcess.running = true
+  }
+
   function retune(automatic) {
     if (playbackState === "loading") return
+    var shouldStop = ["buffering", "playing", "paused"].indexOf(playbackState) >= 0
     recoverWithRetune = true
     if (automatic !== true) automaticRetuneAttempts = 0
     autoplayPending = false
     if (resumeProcess.running) resumeProcess.running = false
     persistPosition()
-    if (["buffering", "playing", "paused"].indexOf(playbackState) >= 0 && !stopProcess.running) {
-      stopProcess.command = cliCommand(["stop"])
-      stopProcess.running = true
-    }
     errorMessage = ""
     playbackState = "loading"
     tuningFrame = 0
@@ -227,11 +233,13 @@ Panel {
     } else {
       tuningTimer.start()
     }
-    var argumentsList = ["discover", "--band", band, "--range", range]
-    if (band === "people" && person) argumentsList = argumentsList.concat(["--person", person])
-    argumentsList.push("--json")
-    discoverProcess.command = cliCommand(argumentsList)
-    discoverProcess.running = true
+    if (shouldStop) {
+      retuneWaitingForStop = true
+      stopProcess.command = cliCommand(["stop"])
+      stopProcess.running = true
+      return
+    }
+    beginDiscovery()
   }
 
   function checkResume() {
@@ -732,6 +740,11 @@ Panel {
   Process {
     id: stopProcess
     command: []
+    onExited: function() {
+      if (!root.retuneWaitingForStop) return
+      root.retuneWaitingForStop = false
+      root.beginDiscovery()
+    }
   }
 
   Process {
@@ -852,6 +865,7 @@ Panel {
             Text {
               width: parent.width
               text: root.episode ? String(root.episode.podcast || root.episode.artist || "UNKNOWN SOURCE") : (root.playbackState === "loading" ? "SCANNING THE BAND…" : "NO SIGNAL LOCKED")
+              textFormat: Text.PlainText
               color: root.accent
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -862,6 +876,7 @@ Panel {
             Text {
               width: parent.width
               text: root.episode ? root.episodeTitle : "Press Retune to receive a random Bitcoin podcast."
+              textFormat: Text.PlainText
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.heading
@@ -873,6 +888,7 @@ Panel {
             Text {
               width: parent.width
               text: root.episode ? String(root.episode.publishedAt || "") : ""
+              textFormat: Text.PlainText
               color: root.muted
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -1108,6 +1124,7 @@ Panel {
               visible: root.errorMessage !== ""
               width: parent.width
               text: root.errorMessage
+              textFormat: Text.PlainText
               color: root.urgent
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -1193,6 +1210,7 @@ Panel {
             visible: root.viewMode === "receiver" && root.errorMessage !== ""
             width: parent.width
             text: "SIGNAL LOST  //  " + root.errorMessage
+            textFormat: Text.PlainText
             color: root.urgent
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
@@ -1243,6 +1261,7 @@ Panel {
       Text {
         width: parent.width
         text: savedOption.podcast.toUpperCase() + (savedOption.published ? "  //  " + savedOption.published : "")
+        textFormat: Text.PlainText
         color: root.accent
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
@@ -1252,6 +1271,7 @@ Panel {
       Text {
         width: parent.width
         text: savedOption.episodeTitle
+        textFormat: Text.PlainText
         color: root.foreground
         font.family: root.fontFamily
         font.pixelSize: Style.font.bodySmall
@@ -1379,6 +1399,7 @@ Panel {
         anchors.verticalCenter: parent.verticalCenter
         width: parent.width - Style.space(25)
         text: tunerOption.label
+        textFormat: Text.PlainText
         color: tunerOption.activeChoice ? root.accent : root.foreground
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption

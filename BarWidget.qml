@@ -56,7 +56,7 @@ BarWidget {
       var signalActive = root.playbackState === "playing" || root.playbackState === "loading"
       var state = Model.compactSignal(root.signalBands, signalActive)
       if (root.barMode === "signal") return state
-      var label = root.podcastName ? root.podcastName : "HodlJuice"
+      var label = root.podcastName ? Model.safeLabel(root.podcastName) : "HodlJuice"
       return state + "  " + label
     }
     fontSize: Style.font.bodySmall

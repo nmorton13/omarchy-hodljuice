@@ -154,9 +154,11 @@ class PlaybackTests(unittest.TestCase):
         socket_path.touch()
         commands = []
 
-        with mock.patch.object(MODULE, "mpv_socket_path", return_value=socket_path), mock.patch.object(
-            MODULE, "mpv_command", side_effect=lambda command: commands.append(command)
-        ), mock.patch.object(MODULE, "wait_for_media_ready") as ready:
+        with mock.patch.object(MODULE, "public_playback_url", side_effect=lambda value: value), mock.patch.object(
+            MODULE, "mpv_socket_path", return_value=socket_path
+        ), mock.patch.object(MODULE, "mpv_command", side_effect=lambda command: commands.append(command)), mock.patch.object(
+            MODULE, "wait_for_media_ready"
+        ) as ready:
             MODULE.start_playback("https://media.example/next.mp3", "Next episode", "Podcast", 12)
 
         ready.assert_called_once_with("https://media.example/next.mp3", 12)
@@ -165,6 +167,37 @@ class PlaybackTests(unittest.TestCase):
             ["set_property", "force-media-title", "Next episode"],
             ["loadfile", "https://media.example/next.mp3", "replace"],
         ])
+
+    def test_public_playback_url_accepts_only_globally_routable_addresses(self):
+        address = (MODULE.socket.AF_INET, MODULE.socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+        with mock.patch.object(MODULE.socket, "getaddrinfo", return_value=[address]):
+            self.assertEqual(
+                MODULE.public_playback_url("https://media.example/episode.mp3"),
+                "https://media.example/episode.mp3",
+            )
+
+    def test_public_playback_url_rejects_private_and_link_local_addresses(self):
+        for host in ("127.0.0.1", "192.168.1.10", "169.254.169.254", "::1"):
+            family = MODULE.socket.AF_INET6 if ":" in host else MODULE.socket.AF_INET
+            address = (family, MODULE.socket.SOCK_STREAM, 6, "", (host, 443))
+            with self.subTest(host=host), mock.patch.object(MODULE.socket, "getaddrinfo", return_value=[address]):
+                with self.assertRaises(MODULE.HodlJuiceError):
+                    MODULE.public_playback_url(f"https://[{host}]/episode.mp3" if ":" in host else f"https://{host}/episode.mp3")
+
+    def test_shutdown_sends_quit_and_waits_for_socket_removal(self):
+        socket_path = Path(self.temp.name) / "mpv.sock"
+        socket_path.touch()
+
+        client = mock.MagicMock()
+        client.__enter__.return_value = client
+        client.sendall.side_effect = lambda payload: socket_path.unlink()
+        with mock.patch.object(MODULE, "mpv_socket_path", return_value=socket_path), mock.patch.object(
+            MODULE.socket, "socket", return_value=client
+        ):
+            MODULE.shutdown_playback()
+
+        command = json.loads(client.sendall.call_args.args[0])
+        self.assertEqual(command, {"command": ["quit"]})
 
     def test_wait_for_media_retries_resume_seek_until_load_is_ready(self):
         seek_attempts = 0
@@ -383,6 +416,12 @@ class EpisodeParserTests(unittest.TestCase):
 
 
 class FetchDocumentTests(unittest.TestCase):
+    def test_hodljuice_redirect_requires_https_on_the_same_origin(self):
+        self.assertTrue(MODULE._same_origin("https://hodljuice.app/next"))
+        self.assertFalse(MODULE._same_origin("http://hodljuice.app/next"))
+        self.assertFalse(MODULE._same_origin("https://hodljuice.app:444/next"))
+        self.assertFalse(MODULE._same_origin("https://evil.example/next"))
+
     def test_redirect_to_foreign_host_is_rejected(self):
         import http.server
         import threading
@@ -407,6 +446,7 @@ class FetchDocumentTests(unittest.TestCase):
         finally:
             server.shutdown()
             thread.join(timeout=5)
+            server.server_close()
 
 
 if __name__ == "__main__":

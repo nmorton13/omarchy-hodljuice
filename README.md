@@ -4,7 +4,7 @@ A theme-native Bitcoin podcast receiver for the Omarchy shell.
 
 HodlJuice tunes into a random episode from [hodljuice.app](https://hodljuice.app), autoplays it through `mpv`, and renders a real 21-band voice signal captured from only the HodlJuice PipeWire stream.
 
-> **Status:** early beta (`0.1.0-dev`). The core Tune → Listen → Retune experience is working and tested on Omarchy 4.
+> **Version 0.1.0.** The core Tune → Listen → Retune experience is working and tested on Omarchy 4.
 
 ![HodlJuice receiver playing a Bitcoin podcast with its live 21-band signal](docs/assets/hodljuice-panel.png)
 
@@ -53,8 +53,11 @@ omarchy bar move nmorton.hodljuice --section center
 Remove it with:
 
 ```bash
+~/.config/omarchy/plugins/nmorton.hodljuice/bin/hodljuice stop
 omarchy plugin remove nmorton.hodljuice
 ```
+
+The stop command terminates HodlJuice's detached `mpv` process before the plugin files are removed. Saved episodes and resume positions are retained under `$XDG_STATE_HOME/hodljuice/`; remove that directory separately only if you also want to delete HodlJuice's local data.
 
 ## Requirements
 
@@ -142,7 +145,7 @@ The QML layer is intentionally thin. Discovery, persistence, `mpv` IPC, and spec
 - [`docs/implementation-plan.md`](docs/implementation-plan.md) — product and architecture plan
 - [`docs/spectrum.md`](docs/spectrum.md) — real-signal design and validation
 
-Known pre-release work includes a recent-history panel, explicit MPRIS validation, analyzer performance measurements, and eventually deciding whether to reintroduce category, people, and calendar-year filters.
+Planned follow-up work includes a recent-history panel, explicit MPRIS validation, analyzer performance measurements, and eventually deciding whether to reintroduce category, people, and calendar-year filters.
 
 ## Privacy
 
