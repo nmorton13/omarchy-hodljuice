@@ -52,21 +52,41 @@ Panel {
   property string pendingRange: range
   property string pendingPerson: person
   property int tunerIndex: 0
+  property int yearIndex: 0
+  readonly property var yearOptions: Model.yearOptions()
   property int personIndex: 0
   property int savedIndex: 0
   property var savedEpisodes: []
   property bool savedLoading: false
+  property string searchQuery: ""
+  property string searchRange: Model.DEFAULT_RANGE
+  property string searchSubmittedQuery: ""
+  property var searchResults: []
+  property int searchIndex: 0
+  property bool searchLoading: false
+  property bool searchComplete: false
+  property string searchError: ""
   property var peopleOptions: []
   property bool peopleLoading: false
   readonly property var tunerRanges: [
     { value: "any", label: "ANY TIME" },
     { value: "7", label: "LAST 7 DAYS" },
-    { value: "30", label: "LAST 30 DAYS" }
+    { value: "30", label: "LAST 30 DAYS" },
+    { value: "year", label: "SPECIFIC YEAR" }
   ]
 
   readonly property int panelWidth: Style.space(440)
   readonly property real savedRowHeight: Style.space(58)
   readonly property real savedRowSpacing: Style.space(5)
+  readonly property bool canSelectEpisode: playbackState !== "loading" && playbackState !== "buffering"
+    && !restoreProcess.running && !discoverProcess.running && !stopProcess.running
+    && !resumeProcess.running && !playProcess.running && !savedCheckProcess.running && !controlProcess.running
+
+  function focusView() {
+    if (!opened) return
+    if (viewMode === "search") searchInput.forceActiveFocus()
+    else keyCatcher.forceActiveFocus()
+  }
 
   function localPath(relativePath) {
     var url = Qt.resolvedUrl(relativePath).toString()
@@ -80,7 +100,7 @@ Panel {
   function open() {
     root.controller.show()
     if (!episode && playbackState !== "loading") retune()
-    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+    Qt.callLater(root.focusView)
   }
 
   function close() { root.persistPosition(); root.controller.hide() }
@@ -120,13 +140,32 @@ Panel {
   }
 
   function chooseTuner(index) {
+    if (index < 0) return
     if (index < tunerRanges.length) {
+      if (tunerRanges[index].value === "year") { openYears(); return }
       pendingBand = "all"
       pendingRange = tunerRanges[index].value
       pendingPerson = ""
     } else {
       applyTuning()
     }
+  }
+
+  function openYears() {
+    yearIndex = 0
+    for (var index = 0; index < yearOptions.length; index++) {
+      if (yearOptions[index].value === pendingRange) { yearIndex = index; break }
+    }
+    viewMode = "years"
+  }
+
+  function chooseYear(index) {
+    if (index < 0 || index >= yearOptions.length) return
+    pendingBand = "all"
+    pendingRange = yearOptions[index].value
+    pendingPerson = ""
+    tunerIndex = tunerRanges.length - 1
+    viewMode = "tuner"
   }
 
   function openPeople() {
@@ -156,17 +195,73 @@ Panel {
     savedListProcess.running = true
   }
 
-  function playSavedEpisode(index) {
-    if (index < 0 || index >= savedEpisodes.length) return
-    if (resumeProcess.running) {
-      Qt.callLater(function() { root.playSavedEpisode(index) })
+  function openSearch() {
+    if (!searchLoading && searchRange !== range) {
+      searchResults = []
+      searchComplete = false
+      searchRange = range
+    }
+    viewMode = "search"
+    Qt.callLater(function() { searchInput.forceActiveFocus() })
+  }
+
+  function submitSearch() {
+    if (searchProcess.running) return
+    var query = searchQuery.trim()
+    if (!query) {
+      searchError = "Enter a topic, guest, podcast, or phrase."
       return
     }
+    searchSubmittedQuery = query
+    searchError = ""
+    searchComplete = false
+    searchLoading = true
+    searchResults = []
+    searchIndex = 0
+    searchProcess.resultValues = null
+    searchProcess.failureMessage = ""
+    searchProcess.command = cliCommand(["search", "--query", query, "--range", searchRange, "--json"])
+    searchProcess.running = true
+  }
+
+  function finishSearch(exitCode) {
+    searchLoading = false
+    searchComplete = true
+    if (exitCode !== 0 || searchProcess.resultValues === null) {
+      searchResults = []
+      searchError = searchProcess.failureMessage || "Unable to search HodlJuice. Try again."
+      return
+    }
+    searchResults = searchProcess.resultValues
+    searchError = ""
+    if (viewMode === "search" && searchResults.length > 0) Qt.callLater(root.focusSearchResults)
+  }
+
+  function focusSearchResults() {
+    if (searchLoading || searchResults.length === 0) return
+    cursorActive = true
+    keyCatcher.forceActiveFocus()
+    ensureSearchVisible()
+  }
+
+  function playSearchEpisode(index) {
+    if (index < 0 || index >= searchResults.length) return
+    playSelectedEpisode(searchResults[index], false)
+  }
+
+  function playSavedEpisode(index) {
+    if (index < 0 || index >= savedEpisodes.length) return
+    playSelectedEpisode(savedEpisodes[index], true)
+  }
+
+  function playSelectedEpisode(value, knownSaved) {
+    if (!canSelectEpisode) return
+    automaticRetuneTimer.stop()
+    automaticRetuneAttempts = 0
     autoplayPending = false
     persistPosition()
-    var value = savedEpisodes[index]
     episode = value
-    saved = true
+    saved = knownSaved
     resumeSeconds = 0
     positionSeconds = 0
     durationSeconds = 0
@@ -175,6 +270,7 @@ Panel {
     recoverWithRetune = false
     autoplayPending = true
     viewMode = "receiver"
+    if (!knownSaved) checkSaved()
     checkResume()
   }
 
@@ -187,9 +283,16 @@ Panel {
   }
 
   function ensureSavedVisible() {
-    if (viewMode !== "saved") return
+    if (viewMode === "saved") ensureEpisodeVisible(savedList, savedIndex)
+  }
+
+  function ensureSearchVisible() {
+    if (viewMode === "search") ensureEpisodeVisible(searchList, searchIndex)
+  }
+
+  function ensureEpisodeVisible(list, index) {
     Qt.callLater(function() {
-      var rowTop = savedList.y + savedIndex * (root.savedRowHeight + root.savedRowSpacing)
+      var rowTop = list.mapToItem(content, 0, 0).y + index * (root.savedRowHeight + root.savedRowSpacing)
       var rowBottom = rowTop + root.savedRowHeight
       if (rowTop < contentFlickable.contentY)
         contentFlickable.contentY = Math.max(0, rowTop)
@@ -262,7 +365,7 @@ Panel {
     autoplayPending = false
     if (!recoverWithRetune) {
       playbackState = "error"
-      errorMessage = "This saved episode is unavailable. Remove it or Retune."
+      errorMessage = "This episode is unavailable. Choose another episode or Retune."
       return
     }
     if (automaticRetuneTimer.running) return
@@ -368,7 +471,9 @@ Panel {
 
   function activateFocus() {
     if (viewMode === "people") { choosePerson(personIndex); return }
+    if (viewMode === "years") { chooseYear(yearIndex); return }
     if (viewMode === "saved") { playSavedEpisode(savedIndex); return }
+    if (viewMode === "search") { playSearchEpisode(searchIndex); return }
     if (viewMode === "tuner") { chooseTuner(tunerIndex); return }
     if (focusIndex === 0) seek(-30)
     else if (focusIndex === 1) togglePlayback()
@@ -376,10 +481,17 @@ Panel {
     else if (focusIndex === 3) retune()
     else if (focusIndex === 4) saveCurrent()
     else if (focusIndex === 5) openSaved()
+    else if (focusIndex === 6) openSearch()
   }
 
   function moveFocus(dx, dy) {
     cursorActive = true
+    if (viewMode === "years") {
+      var yearTotal = Math.max(1, yearOptions.length)
+      var yearStep = dy !== 0 ? (dy > 0 ? 2 : -2) : (dx > 0 ? 1 : -1)
+      yearIndex = (yearIndex + yearStep + yearTotal) % yearTotal
+      return
+    }
     if (viewMode === "people") {
       var peopleTotal = Math.max(1, peopleOptions.length)
       if (dy !== 0) personIndex = (personIndex + (dy > 0 ? 1 : peopleTotal - 1)) % peopleTotal
@@ -391,17 +503,27 @@ Panel {
       ensureSavedVisible()
       return
     }
+    if (viewMode === "search") {
+      var searchTotal = Math.max(1, searchResults.length)
+      if (dy !== 0) searchIndex = (searchIndex + (dy > 0 ? 1 : searchTotal - 1)) % searchTotal
+      ensureSearchVisible()
+      return
+    }
     if (viewMode === "tuner") {
       var total = tunerRanges.length + 1
       if (dy !== 0) tunerIndex = (tunerIndex + (dy > 0 ? 1 : total - 1)) % total
       else if (dx !== 0) tunerIndex = (tunerIndex + (dx > 0 ? 1 : total - 1)) % total
       return
     }
-    if (dy !== 0) focusIndex = (focusIndex + (dy > 0 ? 1 : 5)) % 6
-    else if (dx !== 0) focusIndex = (focusIndex + (dx > 0 ? 1 : 5)) % 6
+    if (dy !== 0) focusIndex = (focusIndex + (dy > 0 ? 1 : 6)) % 7
+    else if (dx !== 0) focusIndex = (focusIndex + (dx > 0 ? 1 : 6)) % 7
   }
 
-  onOpenedChanged: if (opened) Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  onOpenedChanged: if (opened) Qt.callLater(root.focusView)
+  onViewModeChanged: {
+    contentFlickable.contentY = 0
+    Qt.callLater(root.focusView)
+  }
   onPlaybackStateChanged: {
     Qt.callLater(root.syncSpectrum)
     Qt.callLater(root.syncWatch)
@@ -618,6 +740,22 @@ Panel {
   }
 
   Process {
+    id: searchProcess
+    property var resultValues: null
+    property string failureMessage: ""
+    command: []
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: searchProcess.resultValues = Model.parseEpisodeList(text)
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: searchProcess.failureMessage = text.trim()
+    }
+    onExited: function(exitCode) { root.finishSearch(exitCode) }
+  }
+
+  Process {
     id: savedListProcess
     command: []
     stdout: StdioCollector {
@@ -765,22 +903,31 @@ Panel {
     bar: root.bar
     open: root.opened
     centerOnBar: false
-    focusTarget: keyCatcher
+    focusTarget: root.viewMode === "search" ? searchInput : keyCatcher
     contentWidth: panel.fittedContentWidth(root.panelWidth)
     contentHeight: panel.fittedContentHeight(content.implicitHeight, Style.space(700))
 
     ReceiverKeyCatcher {
       id: keyCatcher
+      blocked: searchInput.activeFocus
       anchors.fill: parent
       onMoveRequested: function(dx, dy) { root.moveFocus(dx, dy) }
       onActivateRequested: root.activateFocus()
       onCloseRequested: {
-        if (root.viewMode === "people") root.viewMode = "tuner"
-        else if (root.viewMode === "saved" || root.viewMode === "tuner") root.viewMode = "receiver"
+        if (root.viewMode === "people" || root.viewMode === "years") root.viewMode = "tuner"
+        else if (root.viewMode === "saved" || root.viewMode === "tuner" || root.viewMode === "search") root.viewMode = "receiver"
         else root.close()
       }
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(text) {
+        if (root.viewMode === "search") {
+          if (text === "/") {
+            contentFlickable.contentY = 0
+            searchInput.forceActiveFocus()
+          }
+          return
+        }
+        if (text === "/") { root.openSearch(); return }
         if (root.viewMode === "saved") {
           if (text === "s" || text === "S" || text === "x" || text === "X") root.removeSavedEpisode(root.savedIndex)
           else if (text === "b" || text === "B") root.viewMode = "receiver"
@@ -788,7 +935,7 @@ Panel {
         }
         if (text === "b" || text === "B") { root.openSaved(); return }
         if (text === "t" || text === "T") {
-          if (root.viewMode === "people") root.viewMode = "tuner"
+          if (root.viewMode === "people" || root.viewMode === "years") root.viewMode = "tuner"
           else root.toggleTuner()
           return
         }
@@ -988,12 +1135,22 @@ Panel {
             }
           }
 
-          ReceiverButton {
+          Row {
             visible: root.viewMode === "receiver"
             width: parent.width
-            label: "SAVED EPISODES"
-            selected: root.cursorActive && root.focusIndex === 5
-            onTriggered: root.openSaved()
+            spacing: Style.space(8)
+            ReceiverButton {
+              width: (parent.width - parent.spacing) / 2
+              label: "SAVED EPISODES"
+              selected: root.cursorActive && root.focusIndex === 5
+              onTriggered: root.openSaved()
+            }
+            ReceiverButton {
+              width: (parent.width - parent.spacing) / 2
+              label: "SEARCH"
+              selected: root.cursorActive && root.focusIndex === 6
+              onTriggered: root.openSearch()
+            }
           }
 
           Rectangle {
@@ -1049,9 +1206,9 @@ Panel {
                   required property var modelData
                   required property int index
                   width: parent.width
-                  label: modelData.label
+                  label: modelData.value === "year" && Model.isYear(root.pendingRange) ? "YEAR  //  " + root.pendingRange : modelData.label
                   choiceIndex: index
-                  activeChoice: root.pendingRange === modelData.value
+                  activeChoice: modelData.value === "year" ? Model.isYear(root.pendingRange) : root.pendingRange === modelData.value
                   selected: root.cursorActive && root.tunerIndex === index
                   onTriggered: root.chooseTuner(index)
                 }
@@ -1060,7 +1217,7 @@ Panel {
 
             Text {
               width: parent.width
-              text: "Choose how far back HodlJuice should search."
+              text: "Choose a recent time window or a specific publication year. This filter applies to Retune and Search."
               color: root.muted
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -1073,6 +1230,148 @@ Panel {
               selected: root.cursorActive && root.tunerIndex === root.tunerRanges.length
               emphasized: true
               onTriggered: root.applyTuning()
+            }
+          }
+
+          Column {
+            visible: root.viewMode === "years"
+            width: parent.width
+            spacing: Style.space(10)
+            Text {
+              width: parent.width
+              text: "CHOOSE A YEAR"
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.heading
+              font.bold: true
+              font.letterSpacing: 1
+            }
+            Text {
+              width: parent.width
+              text: "Filter by publication year. Coverage is thinner before 2018."
+              color: root.muted
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+            Grid {
+              width: parent.width
+              columns: 2
+              spacing: Style.space(6)
+              Repeater {
+                model: root.yearOptions
+                TunerOption {
+                  required property var modelData
+                  required property int index
+                  width: (parent.width - parent.spacing) / 2
+                  label: modelData.label
+                  choiceIndex: index
+                  yearChoice: true
+                  activeChoice: root.pendingRange === modelData.value
+                  selected: root.cursorActive && root.yearIndex === index
+                  onTriggered: root.chooseYear(index)
+                }
+              }
+            }
+            ReceiverButton {
+              width: parent.width
+              label: "BACK TO TUNER"
+              onTriggered: root.viewMode = "tuner"
+            }
+          }
+
+          Column {
+            visible: root.viewMode === "search"
+            width: parent.width
+            spacing: Style.space(10)
+
+            Text {
+              width: parent.width
+              text: "SEARCH EPISODES"
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.heading
+              font.bold: true
+              font.letterSpacing: 1
+            }
+            TextField {
+              id: searchInput
+              width: parent.width
+              text: root.searchQuery
+              onTextChanged: root.searchQuery = text
+              placeholderText: "Topic, guest, podcast, or phrase"
+              maximumLength: 200
+              readOnly: root.searchLoading
+              foreground: root.foreground
+              accent: root.accent
+              font.family: root.fontFamily
+              onAccepted: root.submitSearch()
+              Keys.onPressed: function(event) {
+                if (event.key === Qt.Key_Escape) {
+                  root.viewMode = "receiver"
+                  event.accepted = true
+                } else if (event.key === Qt.Key_Down || event.key === Qt.Key_Tab) {
+                  root.focusSearchResults()
+                  event.accepted = true
+                }
+              }
+            }
+            ReceiverButton {
+              width: parent.width
+              label: root.searchLoading ? "SEARCHING…" : "SEARCH  //  " + Model.filterLabel(root.searchRange)
+              enabled: !root.searchLoading && root.searchQuery.trim() !== ""
+              emphasized: true
+              onTriggered: root.submitSearch()
+            }
+            Text {
+              width: parent.width
+              text: root.searchLoading ? "Searching HodlJuice…" : (root.searchComplete && !root.searchError ?
+                (root.searchResults.length === 0 ? "No playable matches. Try another phrase or a wider time filter." :
+                  root.searchResults.length + " results for “" + root.searchSubmittedQuery + "”. Select one to resume and play.") :
+                "Search uses the active time filter. Your current episode keeps playing until you choose a result.")
+              textFormat: Text.PlainText
+              color: root.muted
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+            Column {
+              id: searchList
+              visible: !root.searchLoading && root.searchResults.length > 0
+              width: parent.width
+              spacing: root.savedRowSpacing
+              Repeater {
+                model: root.searchResults
+                EpisodeOption {
+                  required property var modelData
+                  required property int index
+                  width: parent.width
+                  podcast: String(modelData.podcast || "Unknown podcast")
+                  episodeTitle: String(modelData.title || "Untitled episode")
+                  published: String(modelData.publishedAt || "")
+                  choiceIndex: index
+                  removable: false
+                  playable: root.canSelectEpisode
+                  selected: root.cursorActive && !searchInput.activeFocus && root.searchIndex === index
+                  onHighlighted: function(index) { root.searchIndex = index }
+                  onTriggered: root.playSearchEpisode(index)
+                }
+              }
+            }
+            Text {
+              visible: root.searchError !== ""
+              width: parent.width
+              text: root.searchError
+              textFormat: Text.PlainText
+              color: root.urgent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+            ReceiverButton {
+              width: parent.width
+              label: "BACK TO RECEIVER"
+              onTriggered: root.viewMode = "receiver"
             }
           }
 
@@ -1106,7 +1405,7 @@ Panel {
 
               Repeater {
                 model: root.savedEpisodes
-                SavedEpisodeOption {
+                EpisodeOption {
                   required property var modelData
                   required property int index
                   width: parent.width
@@ -1115,6 +1414,8 @@ Panel {
                   published: String(modelData.publishedAt || "")
                   choiceIndex: index
                   selected: root.cursorActive && root.savedIndex === index
+                  playable: root.canSelectEpisode
+                  onHighlighted: function(index) { root.savedIndex = index }
                   onTriggered: root.playSavedEpisode(index)
                   onRemoveRequested: root.removeSavedEpisode(index)
                 }
@@ -1221,7 +1522,8 @@ Panel {
 
           Text {
             width: parent.width
-            text: root.viewMode === "receiver" ? "SPACE  ·  H/L  ·  S SAVE  ·  B SAVED  ·  R RETUNE  ·  T TUNE" : (root.viewMode === "saved" ? "↑/↓ SELECT  ·  ENTER PLAY  ·  S REMOVE  ·  ESC BACK" : "↑/↓ SELECT  ·  ENTER CHOOSE  ·  T BACK  ·  ESC BACK")
+            text: root.viewMode === "receiver" ? "SPACE  ·  H/L  ·  S SAVE  ·  B SAVED  ·  / SEARCH  ·  R RETUNE  ·  T TUNE" : (root.viewMode === "search" ? "ENTER SEARCH/PLAY  ·  ↓ RESULTS  ·  / EDIT  ·  ESC BACK" : (root.viewMode === "saved" ? "↑/↓ SELECT  ·  ENTER PLAY  ·  S REMOVE  ·  ESC BACK" : "↑/↓ SELECT  ·  ENTER CHOOSE  ·  T BACK  ·  ESC BACK"))
+            wrapMode: Text.WordWrap
             color: root.muted
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
@@ -1233,17 +1535,21 @@ Panel {
     }
   }
 
-  component SavedEpisodeOption: Rectangle {
-    id: savedOption
+  component EpisodeOption: Rectangle {
+    id: episodeOption
     property string podcast: ""
     property string episodeTitle: ""
     property string published: ""
     property int choiceIndex: 0
     property bool selected: false
+    property bool removable: true
+    property bool playable: true
     signal triggered()
     signal removeRequested()
+    signal highlighted(int index)
 
     height: root.savedRowHeight
+    opacity: playable ? 1 : 0.45
     radius: Style.cornerRadius
     color: selected || savedMouse.containsMouse
       ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.16)
@@ -1253,14 +1559,14 @@ Panel {
 
     Column {
       anchors.left: parent.left
-      anchors.right: removeButton.left
+      anchors.right: episodeOption.removable ? removeButton.left : parent.right
       anchors.leftMargin: Style.space(10)
       anchors.rightMargin: Style.space(8)
       anchors.verticalCenter: parent.verticalCenter
       spacing: Style.space(2)
       Text {
         width: parent.width
-        text: savedOption.podcast.toUpperCase() + (savedOption.published ? "  //  " + savedOption.published : "")
+        text: episodeOption.podcast.toUpperCase() + (episodeOption.published ? "  //  " + episodeOption.published : "")
         textFormat: Text.PlainText
         color: root.accent
         font.family: root.fontFamily
@@ -1270,7 +1576,7 @@ Panel {
       }
       Text {
         width: parent.width
-        text: savedOption.episodeTitle
+        text: episodeOption.episodeTitle
         textFormat: Text.PlainText
         color: root.foreground
         font.family: root.fontFamily
@@ -1283,16 +1589,17 @@ Panel {
       id: savedMouse
       anchors.fill: parent
       hoverEnabled: true
-      cursorShape: Qt.PointingHandCursor
+      cursorShape: episodeOption.playable ? Qt.PointingHandCursor : Qt.ArrowCursor
       onEntered: {
         root.cursorActive = true
-        root.savedIndex = savedOption.choiceIndex
+        episodeOption.highlighted(episodeOption.choiceIndex)
       }
-      onClicked: savedOption.triggered()
+      onClicked: if (episodeOption.playable) episodeOption.triggered()
     }
 
     Rectangle {
       id: removeButton
+      visible: episodeOption.removable
       z: 2
       anchors.right: parent.right
       anchors.rightMargin: Style.space(8)
@@ -1316,12 +1623,13 @@ Panel {
         anchors.fill: parent
         hoverEnabled: true
         cursorShape: Qt.PointingHandCursor
-        onClicked: savedOption.removeRequested()
+        onClicked: episodeOption.removeRequested()
       }
     }
   }
 
   component ReceiverKeyCatcher: Item {
+    property bool blocked: false
     signal moveRequested(int dx, int dy)
     signal activateRequested()
     signal closeRequested()
@@ -1331,6 +1639,7 @@ Panel {
     focus: true
     Keys.priority: Keys.BeforeItem
     Keys.onPressed: function(event) {
+      if (blocked) return
       if (event.key === Qt.Key_Escape) {
         closeRequested(); event.accepted = true; return
       }
@@ -1367,6 +1676,7 @@ Panel {
     property string label: ""
     property int choiceIndex: 0
     property bool peopleChoice: false
+    property bool yearChoice: false
     property bool activeChoice: false
     property bool selected: false
     signal triggered()
@@ -1416,6 +1726,7 @@ Panel {
       onEntered: {
         root.cursorActive = true
         if (tunerOption.peopleChoice) root.personIndex = tunerOption.choiceIndex
+        else if (tunerOption.yearChoice) root.yearIndex = tunerOption.choiceIndex
         else root.tunerIndex = tunerOption.choiceIndex
       }
       onClicked: tunerOption.triggered()

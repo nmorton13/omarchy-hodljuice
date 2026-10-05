@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "nmorton.hodljuice",
   "name": "HodlJuice",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "Nathan Morton",
   "license": "MIT",
-  "description": "A theme-native Bitcoin podcast broadcast receiver with random discovery and a live voice signal",
+  "description": "A theme-native Bitcoin podcast receiver with MCP discovery, episode search, and a live voice signal",
   "kinds": ["bar-widget"],
   "entryPoints": {
     "barWidget": "BarWidget.qml"

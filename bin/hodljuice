@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """HodlJuice discovery and mpv control CLI.
 
-This is the first vertical-slice adapter. The website parser is intentionally
-isolated so a versioned JSON API can replace it without changing the plugin.
+Random discovery uses HodlJuice's MCP endpoint, with HTML as a compatibility
+fallback. Both adapters return the same metadata for playback and the plugin.
 """
 
 from __future__ import annotations
@@ -18,14 +18,18 @@ import subprocess
 import sys
 import time
 import urllib.parse
+import uuid
 from dataclasses import asdict, dataclass
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
+VERSION = "0.2.0"
 BASE_URL = "https://hodljuice.app"
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
-USER_AGENT = "HodlJuice-Omarchy/0.1 (+https://hodljuice.app)"
+MCP_PROTOCOL_VERSION = "2025-03-26"
+MCP_TIMEOUT = 8.0
+USER_AGENT = f"HodlJuice-Omarchy/{VERSION} (+https://hodljuice.app)"
 SPECTRUM_BANDS = 21
 SPECTRUM_RATE = 16_000
 SPECTRUM_WINDOW = 640
@@ -137,7 +141,10 @@ class EpisodeParser(HTMLParser):
 def _http_url(value: str, *, allow_relative: bool = False) -> str:
     if allow_relative and value.startswith("/"):
         return urllib.parse.urljoin(BASE_URL, value)
-    parsed = urllib.parse.urlparse(value)
+    try:
+        parsed = urllib.parse.urlparse(value)
+    except ValueError:
+        return ""
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return ""
     return value
@@ -189,6 +196,17 @@ def public_playback_url(value: str) -> str:
     return url
 
 
+def time_filter_arguments(range_value: str) -> dict[str, int]:
+    if range_value in {"", "any"}:
+        return {}
+    if range_value in {"7", "30"}:
+        return {"days": int(range_value)}
+    if (len(range_value) == 4 and range_value.isascii() and range_value.isdigit()
+            and 2011 <= int(range_value) <= 2100):
+        return {"year": int(range_value)}
+    raise HodlJuiceError(f"Unsupported range: {range_value}. Use any, 7, 30, or a year from 2011 to 2100")
+
+
 def build_discovery_url(
     band: str = "all",
     range_value: str = "any",
@@ -217,8 +235,7 @@ def build_discovery_url(
     elif range_value not in {"", "any"}:
         if band != "all":
             raise HodlJuiceError("The current HodlJuice site cannot combine a category with a time range")
-        if range_value not in {"7", "30"} and not (len(range_value) == 4 and range_value.isdigit()):
-            raise HodlJuiceError(f"Unsupported range: {range_value}")
+        time_filter_arguments(range_value)
         query["year"] = range_value
     elif band == "all":
         # The site's empty year filter is its reliable all-time random route.
@@ -260,7 +277,8 @@ def parse_episode(document: str, source_url: str) -> Episode:
     )
 
 
-def fetch_document(url: str, timeout: float = 18.0) -> str:
+def fetch_response(request: Any, timeout: float) -> tuple[str, Any]:
+    """Bound both adapters' responses and refuse cross-origin redirects."""
     import urllib.error
     import urllib.request
 
@@ -277,24 +295,40 @@ def fetch_document(url: str, timeout: float = 18.0) -> str:
                 raise HodlJuiceError("HodlJuice redirected to an unexpected host")
             return new_request
 
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html"})
     opener = urllib.request.build_opener(_HodlJuiceRedirectHandler())
     try:
-        with opener.open(request, timeout=timeout) as response:
-            declared_size = response.headers.get("Content-Length")
-            try:
-                response_size = int(declared_size) if declared_size else None
-            except (TypeError, ValueError):
-                response_size = None
-            if response_size is not None and response_size > MAX_RESPONSE_BYTES:
-                raise HodlJuiceError("HodlJuice response exceeded the size limit")
-            body = response.read(MAX_RESPONSE_BYTES + 1)
-            if len(body) > MAX_RESPONSE_BYTES:
-                raise HodlJuiceError("HodlJuice response exceeded the size limit")
-            charset = response.headers.get_content_charset() or "utf-8"
+        response = opener.open(request, timeout=timeout)
+    except urllib.error.HTTPError as error:
+        error.close()
+        raise
+    with response:
+        declared_size = response.headers.get("Content-Length")
+        try:
+            response_size = int(declared_size) if declared_size else None
+        except (TypeError, ValueError):
+            response_size = None
+        if response_size is not None and response_size > MAX_RESPONSE_BYTES:
+            raise HodlJuiceError("HodlJuice response exceeded the size limit")
+        body = response.read(MAX_RESPONSE_BYTES + 1)
+        if len(body) > MAX_RESPONSE_BYTES:
+            raise HodlJuiceError("HodlJuice response exceeded the size limit")
+        charset = response.headers.get_content_charset() or "utf-8"
+        try:
+            return body.decode(charset, errors="replace"), response.headers
+        except LookupError as error:
+            raise HodlJuiceError("HodlJuice returned an unsupported character encoding") from error
+
+
+def fetch_document(url: str, timeout: float = 18.0) -> str:
+    import urllib.error
+    import urllib.request
+
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html"})
+    try:
+        document, _ = fetch_response(request, timeout)
+        return document
     except (urllib.error.URLError, TimeoutError, OSError) as error:
         raise HodlJuiceError(f"Unable to reach HodlJuice: {error}") from error
-    return body.decode(charset, errors="replace")
 
 
 def fetch_people(timeout: float = 18.0) -> list[dict[str, str]]:
@@ -307,6 +341,161 @@ def fetch_people(timeout: float = 18.0) -> list[dict[str, str]]:
 
 def fetch_episode(url: str, timeout: float = 18.0) -> Episode:
     return parse_episode(fetch_document(url, timeout), url)
+
+
+def mcp_request(
+    method: str, params: dict[str, Any], request_id: str | None,
+    session: str, deadline: float,
+) -> tuple[dict[str, Any], str]:
+    import urllib.request
+
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise HodlJuiceError("HodlJuice MCP request timed out")
+    message: dict[str, Any] = {"jsonrpc": "2.0", "method": method, "params": params}
+    if request_id is not None:
+        message["id"] = request_id
+    headers = {
+        "User-Agent": USER_AGENT, "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "MCP-Protocol-Version": MCP_PROTOCOL_VERSION,
+    }
+    if session:
+        headers["Mcp-Session-Id"] = session
+    request = urllib.request.Request(BASE_URL + "/mcp", data=json.dumps(message).encode(), headers=headers)
+    body, response_headers = fetch_response(request, remaining)
+    session = response_headers.get("Mcp-Session-Id", session)
+    if session and (len(session) > 512 or not all(0x21 <= ord(char) <= 0x7E for char in session)):
+        raise HodlJuiceError("HodlJuice MCP returned an invalid session ID")
+    if request_id is None:
+        return {}, session
+    try:
+        response = json.loads(body)
+    except (ValueError, RecursionError) as error:
+        raise HodlJuiceError("HodlJuice MCP returned invalid JSON") from error
+    if (not isinstance(response, dict) or response.get("jsonrpc") != "2.0"
+            or response.get("id") != request_id or "error" in response
+            or not isinstance(response.get("result"), dict)):
+        raise HodlJuiceError("HodlJuice MCP request failed")
+    return response["result"], session
+
+
+def mcp_call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    import urllib.error
+
+    deadline = time.monotonic() + MCP_TIMEOUT
+    cache_path = runtime_dir() / "mcp-session.json"
+    cached = read_json_file(cache_path, {})
+    session = cached.get("session", "") if isinstance(cached, dict) else ""
+    if (not isinstance(session, str) or len(session) > 512
+            or not all(0x21 <= ord(char) <= 0x7E for char in session)):
+        session = ""
+    for attempt in range(2):
+        if not session:
+            initialized, session = mcp_request("initialize", {
+                "protocolVersion": MCP_PROTOCOL_VERSION, "capabilities": {},
+                "clientInfo": {"name": "hodljuice-omarchy", "version": VERSION},
+            }, str(uuid.uuid4()), "", deadline)
+            if initialized.get("protocolVersion") != MCP_PROTOCOL_VERSION:
+                raise HodlJuiceError("HodlJuice MCP negotiated an unsupported protocol")
+            mcp_request("notifications/initialized", {}, None, session, deadline)
+            atomic_json_write(cache_path, {"session": session})
+        try:
+            result, _ = mcp_request("tools/call", {
+                "name": name, "arguments": arguments,
+            }, str(uuid.uuid4()), session, deadline)
+            break
+        except urllib.error.HTTPError as error:
+            if error.code != 404 or attempt != 0 or not session:
+                raise
+            # MCP specifies 404 for a session lost after a server restart.
+            session = ""
+            cache_path.unlink(missing_ok=True)
+
+    if result.get("isError"):
+        raise HodlJuiceError(f"HodlJuice MCP {name} failed")
+    data = result.get("structuredContent")
+    if data is None:
+        content = result.get("content", [])
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str):
+                    try:
+                        data = json.loads(item["text"])
+                        break
+                    except (ValueError, RecursionError):
+                        continue
+    if not isinstance(data, dict):
+        raise HodlJuiceError("HodlJuice MCP returned no structured result")
+    return data
+
+
+def episode_from_mcp(data: Any) -> Episode:
+    if not isinstance(data, dict):
+        raise HodlJuiceError("HodlJuice MCP returned invalid episode metadata")
+
+    def field(name: str) -> str:
+        value = data.get(name)
+        return value.strip() if isinstance(value, str) else ""
+
+    audio_url = _http_url(field("audio_url"))
+    if not audio_url or not field("title") or not field("podcast"):
+        raise HodlJuiceError("HodlJuice MCP returned invalid episode metadata")
+    return Episode(
+        guid=field("id"), title=field("title"), podcast=field("podcast"), artist="",
+        audioUrl=audio_url, podcastUrl="",
+        artworkUrl=_http_url(field("artwork_url"), allow_relative=True),
+        publishedAt=field("published"), sourceUrl=_http_url(field("play_url")),
+    )
+
+
+def fetch_mcp_episode(range_value: str) -> Episode:
+    return episode_from_mcp(mcp_call_tool("random_episode", time_filter_arguments(range_value)))
+
+
+def search_episodes(query: str, range_value: str = "any", limit: int = 25) -> list[Episode]:
+    import http.client
+    import urllib.error
+
+    query = query.strip()
+    if not query or len(query) > 200:
+        raise HodlJuiceError("Search requires a query between 1 and 200 characters")
+    if not 1 <= limit <= 25:
+        raise HodlJuiceError("Search requires a limit between 1 and 25")
+    arguments: dict[str, Any] = {"query": query, "limit": limit}
+    arguments.update(time_filter_arguments(range_value))
+    try:
+        data = mcp_call_tool("search_episodes", arguments)
+    except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError) as error:
+        raise HodlJuiceError(f"Unable to search HodlJuice: {error}") from error
+    if not isinstance(data.get("episodes"), list):
+        raise HodlJuiceError("HodlJuice MCP returned invalid search results")
+    episodes = []
+    for value in data["episodes"]:
+        try:
+            episodes.append(episode_from_mcp(value))
+        except HodlJuiceError:
+            continue
+        if len(episodes) >= limit:
+            break
+    return episodes
+
+
+def discover_episode(
+    band: str = "all", range_value: str = "any",
+    person: str | None = None, date: str | None = None,
+) -> Episode:
+    import http.client
+    import urllib.error
+
+    url = build_discovery_url(band, range_value, person, date)
+    if band == "all" and not date:
+        try:
+            return fetch_mcp_episode(range_value)
+        except (HodlJuiceError, urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError):
+            # Preserve the exact requested filter when the MCP trial is unavailable.
+            pass
+    return fetch_episode(url)
 
 
 def xdg_state_dir() -> Path:
@@ -804,6 +993,12 @@ def build_parser() -> argparse.ArgumentParser:
     discover.add_argument("--json", action="store_true")
     discover.add_argument("--url-only", action="store_true", help=argparse.SUPPRESS)
 
+    search = subparsers.add_parser("search", help="search episodes by topic, guest, show, or phrase")
+    search.add_argument("--query", required=True)
+    search.add_argument("--range", dest="range_value", default="any", help="any, 7, 30, or a publication year (2011–2100)")
+    search.add_argument("--limit", type=int, default=25)
+    search.add_argument("--json", action="store_true")
+
     people = subparsers.add_parser("people", help="list people exposed by HodlJuice")
     people.add_argument("--json", action="store_true")
 
@@ -851,16 +1046,22 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         if args.command == "discover":
-            url = build_discovery_url(args.band, args.range_value, args.person, args.date)
             if args.url_only:
-                print(url)
+                print(build_discovery_url(args.band, args.range_value, args.person, args.date))
                 return 0
-            episode = fetch_episode(url)
+            episode = discover_episode(args.band, args.range_value, args.person, args.date)
             record_history(episode)
             if args.json:
                 print(json.dumps(asdict(episode), ensure_ascii=False))
             else:
                 print(f"{episode.podcast} — {episode.title}\n{episode.audioUrl}")
+        elif args.command == "search":
+            episodes = search_episodes(args.query, args.range_value, args.limit)
+            if args.json:
+                print(json.dumps([asdict(episode) for episode in episodes], ensure_ascii=False))
+            else:
+                for episode in episodes:
+                    print(f"{episode.podcast} — {episode.title}\n{episode.audioUrl}")
         elif args.command == "people":
             people = fetch_people()
             if args.json:

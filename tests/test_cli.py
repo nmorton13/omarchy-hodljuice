@@ -20,6 +20,13 @@ sys.modules[LOADER.name] = MODULE
 LOADER.exec_module(MODULE)
 
 
+class VersionTests(unittest.TestCase):
+    def test_cli_and_manifest_versions_match(self):
+        version = json.loads((ROOT / "manifest.json").read_text())["version"]
+        self.assertEqual(MODULE.VERSION, version)
+        self.assertTrue(MODULE.USER_AGENT.startswith(f"HodlJuice-Omarchy/{version} "))
+
+
 class DiscoveryUrlTests(unittest.TestCase):
     def test_all_any_uses_empty_year_filter(self):
         self.assertEqual(

@@ -4,8 +4,10 @@ cd "$(dirname "$0")/.."
 
 python3 -m unittest discover -s tests -p 'test_*.py' -v
 node tests/model.test.js
+node tests/panel.test.js
 python3 -m py_compile bin/hodljuice
 node --check tests/model.test.js
+node --check tests/panel.test.js
 jq empty manifest.json
 bash tests/validate-manifest.sh
 bash -n tests/*.sh

@@ -3,9 +3,27 @@
 var BAND_COUNT = 21
 var VALID_RANGES = ["any", "7", "30"]
 var DEFAULT_RANGE = "any"
+var MIN_YEAR = 2011
+var MAX_YEAR = 2100
+
+function isYear(value) {
+  var text = String(value || "")
+  return /^[0-9]{4}$/.test(text) && Number(text) >= MIN_YEAR && Number(text) <= MAX_YEAR
+}
 
 function normalizeRange(value) {
-  return VALID_RANGES.indexOf(value) >= 0 ? value : DEFAULT_RANGE
+  var text = String(value || "")
+  return VALID_RANGES.indexOf(text) >= 0 || isYear(text) ? text : DEFAULT_RANGE
+}
+
+function yearOptions(currentYear) {
+  var last = finiteNumber(currentYear)
+  if (last === null) last = new Date().getFullYear()
+  last = Math.min(MAX_YEAR, Math.floor(last))
+  var values = []
+  for (var year = last; year >= MIN_YEAR; year--)
+    values.push({ value: String(year), label: String(year) })
+  return values
 }
 
 function finiteNumber(value) {
@@ -147,6 +165,7 @@ function filterLabel(value) {
   var text = String(value || "any")
   if (text === "7") return "LAST 7 DAYS"
   if (text === "30") return "LAST 30 DAYS"
+  if (isYear(text)) return "YEAR " + text
   return "ANY TIME"
 }
 
